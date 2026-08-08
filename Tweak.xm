@@ -10,7 +10,7 @@
 @end
 
 // ===================================================================
-// 1. 视图层 (View Layer)：允许桌面网格存在空隙
+// 1. 视图层：开放桌面网格存在空隙 (Gaps) 的权限
 // ===================================================================
 %hook SBIconListView
 
@@ -29,7 +29,7 @@
 
 
 // ===================================================================
-// 2. 数据层 (Model Layer)：接管并锁死系统原生的位置记录
+// 2. 数据层：接管并锁死系统原生的位置记录，彻底解决崩溃！
 // ===================================================================
 %hook SBIconListModel
 
@@ -43,56 +43,29 @@
     return 1;
 }
 
-// 【核心防御 1】：防止系统偷偷清空我们的自定义位置
-- (void)removeAllFixedIconLocations {
-    // 留空，拦截系统的全局清除，保护我们的自定义排版
-}
-
-- (void)removeFixedIconLocationsForIcons:(id)icons {
-    // 留空，防止批量清除
-}
-
-// 【核心防御 2】：告诉系统，图标放到哪里就是哪里，不要自动往前面吸附！
-- (unsigned long long)bestGridCellIndexForInsertingIcon:(id)icon atGridCellIndex:(unsigned long long)index {
-    return index;
-}
-
-- (unsigned long long)bestGridCellIndexForInsertingIcon:(id)icon atGridCellIndex:(unsigned long long)index gridCellInfoOptions:(unsigned long long)options {
-    return index;
-}
-
-// 【核心防御 3】：瘫痪系统的网格挤压修补算法
+// 【安全防线 1】：从源头瘫痪系统的网格挤压靠拢算法
+// 只要这个方法不执行，系统就不会把你的图标往左上角推挤。
+// 绝不去 Hook 那些带返回值的 repair 修复方法，彻底杜绝 NSMutableSet 崩溃！
 - (void)compactIcons {
-    // 留空，拒绝压缩靠拢
+    // 留空，什么都不做，拒绝压缩靠拢
 }
 
-// ⚠️ 极其关键：必须返回传入的 icons 或者 @[]，绝对不能返回 nil/self 导致 NSArray 崩溃！
-- (id)_updateModelByRepairingGapsIfNecessary {
-    return @[]; 
-}
-
-- (id)_updateModelByRepairingGapsIfNecessaryAvoidingIcons:(id)icons {
-    return @[]; 
-}
-
-- (id)repairModelByEliminatingGapsInIcons:(id)icons avoidingIcons:(id)avoidingIcons {
-    // 原样返回，坚决不清除空隙，同时满足底层 NSMutableSet 接收 NSArray 的类型要求
-    return icons ? icons : @[];
-}
-
-// 【核心防御 4】：在新增和移动图标时，主动把坐标写入系统的“固定坐标字典”里！
+// 【安全防线 2】：当从其它地方（比如 App 资源库）拖入新图标时
 - (id)insertIcon:(id)icon atGridCellIndex:(unsigned long long)index gridCellInfoOptions:(unsigned long long)options mutationOptions:(unsigned long long)mutOptions {
     id result = %orig;
+    // 原生插入成功后，立刻调用苹果的打桩方法，把坐标锁死在 IconState.plist 里
     if (icon && [self respondsToSelector:@selector(setFixedLocation:forIcon:)]) {
-        [self setFixedLocation:index forIcon:icon]; // 落地生根
+        [self setFixedLocation:index forIcon:icon];
     }
     return result;
 }
 
+// 【安全防线 3】：当在桌面内移动图标时
 - (id)moveContainedIcon:(id)icon toGridCellIndex:(unsigned long long)index gridCellInfoOptions:(unsigned long long)options mutationOptions:(unsigned long long)mutOptions {
     id result = %orig;
+    // 移动成功后，同样立刻打桩，解决低概率移动不生效、回弹的问题！
     if (icon && [self respondsToSelector:@selector(setFixedLocation:forIcon:)]) {
-        [self setFixedLocation:index forIcon:icon]; // 落地生根
+        [self setFixedLocation:index forIcon:icon];
     }
     return result;
 }
