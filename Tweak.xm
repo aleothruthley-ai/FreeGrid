@@ -1,73 +1,187 @@
 #import <UIKit/UIKit.h>
 
-// 声明 iOS 底层私有方法，防止编译报错
+// ===================================================================
+// 1. 头文件声明
+// ===================================================================
+@interface SBIcon : NSObject
+- (NSString *)leafIdentifier;
+- (NSString *)applicationBundleIdentifier;
+@end
+
 @interface SBIconListView : UIView
 - (NSString *)iconLocation;
 @end
 
 @interface SBIconListModel : NSObject
+- (NSString *)uniqueIdentifier;
 - (void)setFixedLocation:(unsigned long long)location forIcon:(id)icon;
 @end
 
 // ===================================================================
-// 1. 视图层：开放桌面网格存在空隙 (Gaps) 的权限
+// 2. 本地自定义位置配置管理器 (Plist)
+// ===================================================================
+#define PLIST_PATH @"/var/mobile/Library/Preferences/com.freegrid.layout.plist"
+
+// 读取配置
+static NSMutableDictionary *GetGridConfig() {
+    NSMutableDictionary *config = [NSMutableDictionary dictionaryWithContentsOfFile:PLIST_PATH];
+    return config ? config : [NSMutableDictionary dictionary];
+}
+
+// 异步写入配置（防卡顿）
+static void SaveGridConfig(NSMutableDictionary *config) {
+    if (!config) return;
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
+        [config writeToFile:PLIST_PATH atomically:YES];
+        // 保证 SpringBoard 对该文件拥有读写权限
+        [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions: @0777} ofItemAtPath:PLIST_PATH error:nil];
+    });
+}
+
+// 获取图标的唯一标识符
+static NSString *GetIconID(id icon) {
+    if ([icon respondsToSelector:@selector(leafIdentifier)]) {
+        return [icon leafIdentifier];
+    } else if ([icon respondsToSelector:@selector(applicationBundleIdentifier)]) {
+        return [icon applicationBundleIdentifier];
+    }
+    return nil;
+}
+
+
+// ===================================================================
+// 3. 视图层：开放桌面留空权限
 // ===================================================================
 %hook SBIconListView
 
 - (BOOL)allowsGaps {
     if ([self respondsToSelector:@selector(iconLocation)]) {
         NSString *location = [self iconLocation];
-        // 核心防御：绝对不能让底部的 Dock 栏允许空隙，否则 Dock 会排版错乱
+        // Dock 栏绝对不能留空，否则排版会崩溃
         if (location && [location containsString:@"Dock"]) {
             return %orig;
         }
     }
-    return YES; // 让普通的桌面视图全面支持留空
+    return YES;
 }
 
 %end
 
 
 // ===================================================================
-// 2. 数据层：接管并锁死系统原生的位置记录，彻底解决崩溃！
+// 4. 数据模型层：全面接管坐标读写
 // ===================================================================
 %hook SBIconListModel
 
-// 允许数据模型开启"固定图标位置"功能
 - (BOOL)allowsFixedIconLocations {
     return YES;
 }
 
-// 强制开启系统底层的固定位置行为 (1 = Enabled)
 - (long long)fixedIconLocationBehavior {
     return 1;
 }
 
-// 【安全防线 1】：从源头瘫痪系统的网格挤压靠拢算法
-// 只要这个方法不执行，系统就不会把你的图标往左上角推挤。
-// 绝不去 Hook 那些带返回值的 repair 修复方法，彻底杜绝 NSMutableSet 崩溃！
-- (void)compactIcons {
-    // 留空，什么都不做，拒绝压缩靠拢
-}
+// 【彻底瘫痪自动靠拢与挤压算法】
+- (void)compactIcons { }
 
-// 【安全防线 2】：当从其它地方（比如 App 资源库）拖入新图标时
-- (id)insertIcon:(id)icon atGridCellIndex:(unsigned long long)index gridCellInfoOptions:(unsigned long long)options mutationOptions:(unsigned long long)mutOptions {
-    id result = %orig;
-    // 原生插入成功后，立刻调用苹果的打桩方法，把坐标锁死在 IconState.plist 里
-    if (icon && [self respondsToSelector:@selector(setFixedLocation:forIcon:)]) {
-        [self setFixedLocation:index forIcon:icon];
+// 非常关键：这里必须原样返回传入的 icons 数组！如果返回 nil 会触发 NSMutableSet 异常崩溃！
+- (id)repairModelByEliminatingGapsInIcons:(id)icons avoidingIcons:(id)avoidingIcons {
+    return icons; 
+}
+- (id)_updateModelByRepairingGapsIfNecessary { return @[]; }
+- (id)_updateModelByRepairingGapsIfNecessaryAvoidingIcons:(id)icons { return @[]; }
+
+
+// 【拦截读取】：当系统排版时，强制从我们的 Plist 中获取坐标
+- (unsigned long long)fixedLocationForIcon:(id)icon {
+    NSString *listID = [self uniqueIdentifier]; // 获取当前是第几页、哪个文件夹
+    NSString *iconID = GetIconID(icon);
+
+    if (listID && iconID) {
+        NSDictionary *config = GetGridConfig();
+        NSDictionary *listConfig = config[listID];
+        if (listConfig && listConfig[iconID]) {
+            return [listConfig[iconID] unsignedLongLongValue]; // 强行返回我们保存的坐标
+        }
     }
-    return result;
+    return %orig;
 }
 
-// 【安全防线 3】：当在桌面内移动图标时
+// 【强制防吸附】：无论系统觉得放哪里合适，强行告诉它：手指松开在哪，就放在哪！
+- (unsigned long long)bestGridCellIndexForInsertingIcon:(id)icon atGridCellIndex:(unsigned long long)index {
+    return index;
+}
+
+- (unsigned long long)bestGridCellIndexForInsertingIcon:(id)icon atGridCellIndex:(unsigned long long)index gridCellInfo:(id)info {
+    return index;
+}
+
+- (unsigned long long)bestGridCellIndexForInsertingIcon:(id)icon atGridCellIndex:(unsigned long long)index gridCellInfoOptions:(unsigned long long)options {
+    return index;
+}
+
+
+// 【拦截写入 - 移动】：移动图标后，保存到我们的 Plist
 - (id)moveContainedIcon:(id)icon toGridCellIndex:(unsigned long long)index gridCellInfoOptions:(unsigned long long)options mutationOptions:(unsigned long long)mutOptions {
     id result = %orig;
-    // 移动成功后，同样立刻打桩，解决低概率移动不生效、回弹的问题！
-    if (icon && [self respondsToSelector:@selector(setFixedLocation:forIcon:)]) {
-        [self setFixedLocation:index forIcon:icon];
+    
+    NSString *listID = [self uniqueIdentifier];
+    NSString *iconID = GetIconID(icon);
+    
+    if (listID && iconID && index != NSNotFound) {
+        NSMutableDictionary *config = GetGridConfig();
+        NSMutableDictionary *listConfig = [config[listID] mutableCopy] ?: [NSMutableDictionary dictionary];
+        
+        listConfig[iconID] = @(index);
+        config[listID] = listConfig;
+        SaveGridConfig(config);
+        
+        // 顺便喂给系统原生字典一口，保持内存同步
+        if ([self respondsToSelector:@selector(setFixedLocation:forIcon:)]) {
+            [self setFixedLocation:index forIcon:icon];
+        }
     }
     return result;
+}
+
+// 【拦截写入 - 插入】：新增或从其他页面拖入时，保存到我们的 Plist
+- (id)insertIcon:(id)icon atGridCellIndex:(unsigned long long)index gridCellInfoOptions:(unsigned long long)options mutationOptions:(unsigned long long)mutOptions {
+    id result = %orig;
+    
+    NSString *listID = [self uniqueIdentifier];
+    NSString *iconID = GetIconID(icon);
+    
+    if (listID && iconID && index != NSNotFound) {
+        NSMutableDictionary *config = GetGridConfig();
+        NSMutableDictionary *listConfig = [config[listID] mutableCopy] ?: [NSMutableDictionary dictionary];
+        
+        listConfig[iconID] = @(index);
+        config[listID] = listConfig;
+        SaveGridConfig(config);
+        
+        if ([self respondsToSelector:@selector(setFixedLocation:forIcon:)]) {
+            [self setFixedLocation:index forIcon:icon];
+        }
+    }
+    return result;
+}
+
+// 【拦截写入 - 删除】：从桌面移除图标时，同步清理 Plist 中的记录
+- (void)removeIcon:(id)icon gridCellInfoOptions:(unsigned long long)options mutationOptions:(unsigned long long)mutOptions {
+    %orig;
+    
+    NSString *listID = [self uniqueIdentifier];
+    NSString *iconID = GetIconID(icon);
+    
+    if (listID && iconID) {
+        NSMutableDictionary *config = GetGridConfig();
+        NSMutableDictionary *listConfig = [config[listID] mutableCopy];
+        if (listConfig) {
+            [listConfig removeObjectForKey:iconID];
+            config[listID] = listConfig;
+            SaveGridConfig(config);
+        }
+    }
 }
 
 %end
