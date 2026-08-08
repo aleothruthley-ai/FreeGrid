@@ -1,1 +1,9 @@
-
+Package: com.yourname.freegrid
+Name: FreeGrid
+Version: 1.0.0
+Description: iOS 17+ 桌面图标自由摆放，百分百原生极致流畅！
+Architecture: iphoneos-arm64
+Author: YourName
+Maintainer: YourName
+Section: Tweaks
+Depends: mobilesubstrate, firmware (>= 14.0)
