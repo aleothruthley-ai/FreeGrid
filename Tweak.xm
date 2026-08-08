@@ -10,14 +10,14 @@
 @end
 
 // ===================================================================
-// 1. 视图层：开放桌面网格存在空隙 (Gaps) 的权限
+// 1. 视图层 (View Layer)：允许桌面网格存在空隙
 // ===================================================================
 %hook SBIconListView
 
 - (BOOL)allowsGaps {
-    // 核心防御：绝对不能让底部的 Dock 栏允许空隙，否则 Dock 排版会乱掉
     if ([self respondsToSelector:@selector(iconLocation)]) {
         NSString *location = [self iconLocation];
+        // 核心防御：绝对不能让底部的 Dock 栏允许空隙，否则 Dock 会排版错乱
         if (location && [location containsString:@"Dock"]) {
             return %orig;
         }
@@ -29,7 +29,7 @@
 
 
 // ===================================================================
-// 2. 数据层：接管并锁死系统原生的位置记录，彻底解决崩溃！
+// 2. 数据层 (Model Layer)：接管并锁死系统原生的位置记录
 // ===================================================================
 %hook SBIconListModel
 
@@ -43,67 +43,56 @@
     return 1;
 }
 
-// 屏蔽系统原生的向左上角压缩靠拢的算法
+// 【核心防御 1】：防止系统偷偷清空我们的自定义位置
+- (void)removeAllFixedIconLocations {
+    // 留空，拦截系统的全局清除，保护我们的自定义排版
+}
+
+- (void)removeFixedIconLocationsForIcons:(id)icons {
+    // 留空，防止批量清除
+}
+
+// 【核心防御 2】：告诉系统，图标放到哪里就是哪里，不要自动往前面吸附！
+- (unsigned long long)bestGridCellIndexForInsertingIcon:(id)icon atGridCellIndex:(unsigned long long)index {
+    return index;
+}
+
+- (unsigned long long)bestGridCellIndexForInsertingIcon:(id)icon atGridCellIndex:(unsigned long long)index gridCellInfoOptions:(unsigned long long)options {
+    return index;
+}
+
+// 【核心防御 3】：瘫痪系统的网格挤压修补算法
 - (void)compactIcons {
-    // 留空，什么都不做
+    // 留空，拒绝压缩靠拢
 }
 
-// 欺骗系统：告诉它当前的网格布局永远是“完美”的
-- (BOOL)isGridLayoutValid {
-    return YES;
-}
-
-- (BOOL)isGridLayoutValidWithOptions:(unsigned long long)options {
-    return YES;
-}
-
-- (BOOL)isGridLayoutValid:(id)arg1 {
-    return YES;
-}
-
-- (BOOL)isGridLayoutValidWithOptions:(unsigned long long)options outOfBoundsIcons:(id *)icons {
-    if (icons) *icons = @[];
-    return YES;
-}
-
-
-// ===================================================================
-// 3. 【核心修复】：拦截挤压修复方法，解决移除图标时的崩溃！
-// ===================================================================
-// 之前的崩溃是因为返回了 nil，被底层 NSMutableSet addObjectsFromArray 拒收。
-// 现在强制返回空数组 @[]，告诉系统 0 个图标发生了推挤，完美化解异常！
-
+// ⚠️ 极其关键：必须返回传入的 icons 或者 @[]，绝对不能返回 nil/self 导致 NSArray 崩溃！
 - (id)_updateModelByRepairingGapsIfNecessary {
-    return @[];
-}
-
-- (id)_updateModelByRepairingGapsIfNecessaryAvoidingIcons:(id)icons {
-    return @[];
-}
-
-- (id)repairModelByEliminatingGapsInIcons:(id)icons avoidingIcons:(id)avoidingIcons {
     return @[]; 
 }
 
+- (id)_updateModelByRepairingGapsIfNecessaryAvoidingIcons:(id)icons {
+    return @[]; 
+}
 
-// ===================================================================
-// 4. 用户交互拦截：当用户拖拽放下图标时，强行将其坐标锁死！
-// ===================================================================
+- (id)repairModelByEliminatingGapsInIcons:(id)icons avoidingIcons:(id)avoidingIcons {
+    // 原样返回，坚决不清除空隙，同时满足底层 NSMutableSet 接收 NSArray 的类型要求
+    return icons ? icons : @[];
+}
 
-// 当插入一个图标到网格中时
+// 【核心防御 4】：在新增和移动图标时，主动把坐标写入系统的“固定坐标字典”里！
 - (id)insertIcon:(id)icon atGridCellIndex:(unsigned long long)index gridCellInfoOptions:(unsigned long long)options mutationOptions:(unsigned long long)mutOptions {
     id result = %orig;
     if (icon && [self respondsToSelector:@selector(setFixedLocation:forIcon:)]) {
-        [self setFixedLocation:index forIcon:icon];
+        [self setFixedLocation:index forIcon:icon]; // 落地生根
     }
     return result;
 }
 
-// 当移动一个已存在的图标到新的网格坑位时
 - (id)moveContainedIcon:(id)icon toGridCellIndex:(unsigned long long)index gridCellInfoOptions:(unsigned long long)options mutationOptions:(unsigned long long)mutOptions {
     id result = %orig;
     if (icon && [self respondsToSelector:@selector(setFixedLocation:forIcon:)]) {
-        [self setFixedLocation:index forIcon:icon];
+        [self setFixedLocation:index forIcon:icon]; // 落地生根
     }
     return result;
 }
