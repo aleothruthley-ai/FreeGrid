@@ -1,140 +1,319 @@
 #import <UIKit/UIKit.h>
+#import <Foundation/Foundation.h>
+#import <objc/runtime.h>
 
 // ===================================================================
-// 1. 头文件与方法声明
+// 1. 接口声明（完整，防止编译警告）
 // ===================================================================
 @interface SBIcon : NSObject
 - (NSString *)leafIdentifier;
 - (NSString *)applicationBundleIdentifier;
+- (NSString *)nodeIdentifier;
 @end
 
 @interface SBIconListView : UIView
 - (NSString *)iconLocation;
+- (BOOL)allowsGaps;
 @end
 
 @interface SBIconListModel : NSObject
 - (NSString *)uniqueIdentifier;
 - (unsigned long long)maxNumberOfIcons;
+- (NSArray *)icons;
+- (id)iconAtIndex:(unsigned long long)index;
+- (unsigned long long)indexForIcon:(id)icon;
+- (BOOL)allowsFixedIconLocations;
+- (long long)fixedIconLocationBehavior;
+- (BOOL)isIconFixed:(id)icon;
+- (BOOL)isIconFixed:(id)icon gridCellInfoOptions:(unsigned long long)options;
+- (unsigned long long)fixedLocationForIcon:(id)icon;
+- (void)setFixedLocation:(unsigned long long)location forIcon:(id)icon;
+- (void)setFixedLocation:(unsigned long long)location forIcon:(id)icon options:(unsigned long long)options;
+- (void)removeAllFixedIconLocations;
+- (void)removeFixedIconLocationForIcon:(id)icon;
+- (void)removeFixedIconLocationsForIcons:(id)icons;
+- (void)removeFixedIconLocationsForIconsInGridRange:(struct SBHIconGridRange)range gridCellInfo:(id)info;
+- (void)removeFixedIconLocationsForIconsInGridRange:(struct SBHIconGridRange)range gridCellInfoOptions:(unsigned long long)options;
+- (id)_updateModelByRepairingGapsIfNecessary;
+- (id)_updateModelByRepairingGapsIfNecessaryAvoidingIcons:(id)icons;
+- (id)repairModelByEliminatingGapsInIcons:(id)icons avoidingIcons:(id)avoiding;
+- (BOOL)isGridLayoutValid;
+- (BOOL)isGridLayoutValid:(id)info;
+- (BOOL)isGridLayoutValidWithOptions:(unsigned long long)options;
+- (BOOL)isGridLayoutValidWithOptions:(unsigned long long)options outOfBoundsIcons:(id *)outIcons;
+- (BOOL)canUseFastGridLayoutValidity;
+- (BOOL)requiresSomeFixedIconLocations;
+- (void)setIcons:(NSArray *)icons;
+- (id)setIcons:(id)icons gridCellInfoOptions:(unsigned long long)options;
+- (id)setIcons:(id)icons gridCellInfoOptions:(unsigned long long)options mutationOptions:(unsigned long long)mutationOptions;
+- (id)setIconsFromIconListModel:(id)model;
+- (unsigned long long)bestGridCellIndexForInsertingIcon:(id)icon atGridCellIndex:(unsigned long long)index;
+- (unsigned long long)bestGridCellIndexForInsertingIcon:(id)icon atGridCellIndex:(unsigned long long)index gridCellInfoOptions:(unsigned long long)options;
+- (unsigned long long)bestGridCellIndexForInsertingIcon:(id)icon atGridCellIndex:(unsigned long long)index gridCellInfo:(id)info;
+- (id)insertIcon:(id)icon atGridCellIndex:(unsigned long long)index gridCellInfoOptions:(unsigned long long)options mutationOptions:(unsigned long long)mutationOptions;
+- (id)insertIcon:(id)icon atIndex:(unsigned long long)index options:(unsigned long long)options;
+- (id)moveContainedIcon:(id)icon toGridCellIndex:(unsigned long long)index gridCellInfoOptions:(unsigned long long)options mutationOptions:(unsigned long long)mutationOptions;
+- (void)moveContainedIcon:(id)icon toIndex:(unsigned long long)index options:(unsigned long long)options;
+- (void)removeIcon:(id)icon;
+- (void)removeIcon:(id)icon options:(unsigned long long)options;
+- (void)removeIcon:(id)icon gridCellInfoOptions:(unsigned long long)options mutationOptions:(unsigned long long)mutationOptions;
+- (void)removeIconAtIndex:(unsigned long long)index;
+- (void)removeIconAtIndex:(unsigned long long)index options:(unsigned long long)options;
 @end
 
 // ===================================================================
-// 2. 自建 Plist 坐标管理引擎
+// 2. 坐标管理引擎（rootless / roothide 友好）
 // ===================================================================
+// 使用 /var/mobile 路径，SpringBoard 以 mobile 身份运行，rootless 和 roothide 都可正常读写
 #define PLIST_PATH @"/var/mobile/Library/Preferences/com.freegrid.layout.plist"
 
 static NSMutableDictionary *gGridConfig = nil;
+static dispatch_queue_t gSaveQueue;
 
-// 读取自定义坐标表
-static void LoadGridConfig() {
-    if (!gGridConfig) {
-        gGridConfig = [NSMutableDictionary dictionaryWithContentsOfFile:PLIST_PATH];
-        if (!gGridConfig) gGridConfig = [NSMutableDictionary new];
+static void EnsureSaveQueue(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        gSaveQueue = dispatch_queue_create("com.freegrid.layout.save", DISPATCH_QUEUE_SERIAL);
+    });
+}
+
+static void LoadGridConfig(void) {
+    if (gGridConfig) return;
+    @try {
+        NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:PLIST_PATH];
+        gGridConfig = dict ? [dict mutableCopy] : [NSMutableDictionary new];
+    } @catch (__unused NSException *e) {
+        gGridConfig = [NSMutableDictionary new];
     }
 }
 
-// 后台异步写入，保证零卡顿
-static void SaveGridConfig() {
-    if (gGridConfig) {
-        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
-            [gGridConfig writeToFile:PLIST_PATH atomically:YES];
-            // 给足权限防止跨进程读取失败
-            [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions: @0777} ofItemAtPath:PLIST_PATH error:nil];
-        });
-    }
+static void SaveGridConfig(void) {
+    if (!gGridConfig) return;
+    EnsureSaveQueue();
+    NSDictionary *snapshot = [gGridConfig copy];
+    dispatch_async(gSaveQueue, ^{
+        @try {
+            [snapshot writeToFile:PLIST_PATH atomically:YES];
+            // rootless / roothide 下保证 mobile 可读可写
+            [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions : @0666}
+                                             ofItemAtPath:PLIST_PATH
+                                                    error:nil];
+        } @catch (__unused NSException *e) {}
+    });
 }
 
-// 提取图标唯一 ID (通杀 App 和书签)
+// 通杀 App / 书签 / 文件夹图标
 static NSString *GetIconID(id icon) {
+    if (!icon) return nil;
     if ([icon respondsToSelector:@selector(leafIdentifier)]) {
-        return [icon performSelector:@selector(leafIdentifier)];
-    } else if ([icon respondsToSelector:@selector(applicationBundleIdentifier)]) {
-        return [icon performSelector:@selector(applicationBundleIdentifier)];
+        NSString *leaf = [icon leafIdentifier];
+        if (leaf.length > 0) return leaf;
     }
-    return [icon description];
+    if ([icon respondsToSelector:@selector(applicationBundleIdentifier)]) {
+        NSString *bid = [icon applicationBundleIdentifier];
+        if (bid.length > 0) return bid;
+    }
+    if ([icon respondsToSelector:@selector(nodeIdentifier)]) {
+        NSString *node = [icon nodeIdentifier];
+        if (node.length > 0) return node;
+    }
+    return [NSString stringWithFormat:@"%p", icon];
+}
+
+// 把 plist 里的坐标强制写回系统 Fixed 字典（重越狱后恢复的核心）
+static void ApplyFixedLocationsFromPlist(SBIconListModel *model) {
+    if (!model) return;
+    NSString *listID = [model uniqueIdentifier];
+    if (!listID.length) return;
+
+    LoadGridConfig();
+    NSDictionary *listConfig = gGridConfig[listID];
+    if (!listConfig.count) return;
+
+    NSArray *icons = [model icons];
+    if (!icons.count) return;
+
+    unsigned long long max = [model maxNumberOfIcons];
+    for (id icon in icons) {
+        NSString *iconID = GetIconID(icon);
+        if (!iconID) continue;
+        NSNumber *num = listConfig[iconID];
+        if (!num) continue;
+        unsigned long long loc = [num unsignedLongLongValue];
+        if (loc >= max) continue; // 防御越界
+        // 使用带 options 的接口，减少副作用
+        if ([model respondsToSelector:@selector(setFixedLocation:forIcon:options:)]) {
+            [model setFixedLocation:loc forIcon:icon options:0];
+        } else {
+            [model setFixedLocation:loc forIcon:icon];
+        }
+    }
+}
+
+// 判断是否为 Dock（绝对不能乱搞）
+static BOOL IsDockList(SBIconListModel *model) {
+    // 通过 uniqueIdentifier 或后续扩展，目前简单返回 NO，Dock 由 View 层保护
+    return NO;
 }
 
 // ===================================================================
-// 3. 视图层：开放桌面留空权限
+// 3. 视图层：开放桌面留空
 // ===================================================================
 %hook SBIconListView
 
 - (BOOL)allowsGaps {
     if ([self respondsToSelector:@selector(iconLocation)]) {
         NSString *location = [self iconLocation];
-        // 核心防御：Dock 栏绝对不能留空，否则排版必定崩溃！
-        if (location && [location containsString:@"Dock"]) {
-            return %orig;
+        if (location && ([location containsString:@"Dock"] || [location containsString:@"dock"])) {
+            return %orig; // Dock 必须保持原样，否则必崩
         }
     }
-    return YES; // 桌面全面支持空隙
+    return YES;
 }
 
 %end
 
 // ===================================================================
-// 4. 数据层：强制接管所有图标落点，彻底瘫痪自动靠拢
+// 4. 数据层：强制 Fixed + 瘫痪所有自动靠拢/重排
 // ===================================================================
 %hook SBIconListModel
 
+// -------------------- 基础开关 --------------------
 - (BOOL)allowsFixedIconLocations {
     return YES;
 }
 
 - (long long)fixedIconLocationBehavior {
-    return 1; // 强制启用系统底层的固定位置逻辑
+    return 1; // 强制启用固定位置行为
 }
 
-// 【彻底瘫痪自动靠拢与挤压算法】
-- (void)compactIcons { 
-    // 留空，什么都不做，拒绝系统排版靠拢
+- (BOOL)requiresSomeFixedIconLocations {
+    return YES;
 }
 
-// 【防御 1】：拦截读取，强制从我们的 Plist 返回坐标
-- (unsigned long long)fixedLocationForIcon:(id)icon {
+// -------------------- isIconFixed 系列（核心） --------------------
+- (BOOL)isIconFixed:(id)icon {
+    if (!icon || IsDockList(self)) return %orig;
     NSString *listID = [self uniqueIdentifier];
     NSString *iconID = GetIconID(icon);
-    
     if (listID && iconID) {
         LoadGridConfig();
-        NSDictionary *listConfig = gGridConfig[listID];
-        if (listConfig && listConfig[iconID]) {
-            return [listConfig[iconID] unsignedLongLongValue];
+        NSDictionary *cfg = gGridConfig[listID];
+        if (cfg && cfg[iconID]) return YES;
+    }
+    // 即使没有记录也返回 YES，配合 fixedLocationForIcon 使用当前 index，彻底禁止自动排序
+    return YES;
+}
+
+- (BOOL)isIconFixed:(id)icon gridCellInfoOptions:(unsigned long long)options {
+    return [self isIconFixed:icon];
+}
+
+// -------------------- 读取坐标（重越狱后生效的关键） --------------------
+- (unsigned long long)fixedLocationForIcon:(id)icon {
+    if (!icon || IsDockList(self)) return %orig;
+    NSString *listID = [self uniqueIdentifier];
+    NSString *iconID = GetIconID(icon);
+    if (listID && iconID) {
+        LoadGridConfig();
+        NSDictionary *cfg = gGridConfig[listID];
+        if (cfg && cfg[iconID]) {
+            unsigned long long loc = [cfg[iconID] unsignedLongLongValue];
+            if (loc < [self maxNumberOfIcons]) return loc;
         }
     }
+    // 没有记录时返回当前真实 index，保证不会乱飞
+    unsigned long long idx = [self indexForIcon:icon];
+    if (idx != NSNotFound) return idx;
     return %orig;
 }
 
-// 【防御 2】：无论系统觉得放哪合适，强制回答：手指落在哪，就放哪！
+// -------------------- 彻底禁止系统清空 Fixed --------------------
+- (void)removeAllFixedIconLocations {
+    // 空实现
+}
+
+- (void)removeFixedIconLocationForIcon:(id)icon {
+    // 空实现（我们自己在 removeIcon 里清 plist）
+}
+
+- (void)removeFixedIconLocationsForIcons:(id)icons {
+    // 空实现
+}
+
+- (void)removeFixedIconLocationsForIconsInGridRange:(struct SBHIconGridRange)range gridCellInfo:(id)info {
+    // 空实现
+}
+
+- (void)removeFixedIconLocationsForIconsInGridRange:(struct SBHIconGridRange)range gridCellInfoOptions:(unsigned long long)options {
+    // 空实现
+}
+
+// -------------------- 瘫痪所有补洞 / 重排 / 合法性校验 --------------------
+- (id)_updateModelByRepairingGapsIfNecessary {
+    return nil;
+}
+
+- (id)_updateModelByRepairingGapsIfNecessaryAvoidingIcons:(id)icons {
+    return nil;
+}
+
+- (id)repairModelByEliminatingGapsInIcons:(id)icons avoidingIcons:(id)avoiding {
+    return icons; // 原样返回，不消除空隙
+}
+
+- (BOOL)isGridLayoutValid {
+    return YES;
+}
+
+- (BOOL)isGridLayoutValid:(id)info {
+    return YES;
+}
+
+- (BOOL)isGridLayoutValidWithOptions:(unsigned long long)options {
+    return YES;
+}
+
+- (BOOL)isGridLayoutValidWithOptions:(unsigned long long)options outOfBoundsIcons:(id *)outIcons {
+    if (outIcons) *outIcons = nil;
+    return YES;
+}
+
+- (BOOL)canUseFastGridLayoutValidity {
+    return NO; // 禁用快速路径，避免绕过我们的逻辑
+}
+
+// -------------------- 强制插入点永远是手指落下的位置 --------------------
 - (unsigned long long)bestGridCellIndexForInsertingIcon:(id)icon atGridCellIndex:(unsigned long long)index {
-    if (index != NSNotFound && index < [self maxNumberOfIcons]) {
-        return index;
-    }
+    if (index != NSNotFound && index < [self maxNumberOfIcons]) return index;
     return %orig;
 }
 
 - (unsigned long long)bestGridCellIndexForInsertingIcon:(id)icon atGridCellIndex:(unsigned long long)index gridCellInfoOptions:(unsigned long long)options {
-    if (index != NSNotFound && index < [self maxNumberOfIcons]) {
-        return index;
-    }
+    if (index != NSNotFound && index < [self maxNumberOfIcons]) return index;
     return %orig;
 }
 
-// 【防御 3】：屏蔽系统清空坐标的行为，守护我们的自定义布局
-- (void)removeAllFixedIconLocations { }
-- (void)removeFixedIconLocationsForIcons:(id)icons { }
+- (unsigned long long)bestGridCellIndexForInsertingIcon:(id)icon atGridCellIndex:(unsigned long long)index gridCellInfo:(id)info {
+    if (index != NSNotFound && index < [self maxNumberOfIcons]) return index;
+    return %orig;
+}
 
-
-// ===================================================================
-// 5. 坐标记录打桩：操作完成后同步写入 Plist
-// ===================================================================
-
-- (id)insertIcon:(id)icon atGridCellIndex:(unsigned long long)index gridCellInfoOptions:(unsigned long long)options mutationOptions:(unsigned long long)mutOptions {
+// -------------------- 记录 + 真正写入系统 Fixed（移动/插入） --------------------
+- (id)insertIcon:(id)icon atGridCellIndex:(unsigned long long)index gridCellInfoOptions:(unsigned long long)options mutationOptions:(unsigned long long)mutationOptions {
     id result = %orig;
-    
+    if (!icon || index == NSNotFound || IsDockList(self)) return result;
+
     NSString *listID = [self uniqueIdentifier];
     NSString *iconID = GetIconID(icon);
-    
-    if (listID && iconID && index != NSNotFound) {
+    if (listID && iconID && index < [self maxNumberOfIcons]) {
+        // 1. 写进系统 Fixed 字典
+        if ([self respondsToSelector:@selector(setFixedLocation:forIcon:options:)]) {
+            [self setFixedLocation:index forIcon:icon options:0];
+        } else {
+            [self setFixedLocation:index forIcon:icon];
+        }
+        // 2. 持久化到我们的 plist
         LoadGridConfig();
         NSMutableDictionary *listConfig = [gGridConfig[listID] mutableCopy] ?: [NSMutableDictionary new];
         listConfig[iconID] = @(index);
@@ -144,38 +323,137 @@ static NSString *GetIconID(id icon) {
     return result;
 }
 
-- (id)moveContainedIcon:(id)icon toGridCellIndex:(unsigned long long)index gridCellInfoOptions:(unsigned long long)options mutationOptions:(unsigned long long)mutOptions {
+- (id)insertIcon:(id)icon atIndex:(unsigned long long)index options:(unsigned long long)options {
     id result = %orig;
-    
-    NSString *listID = [self uniqueIdentifier];
-    NSString *iconID = GetIconID(icon);
-    
-    if (listID && iconID && index != NSNotFound) {
-        LoadGridConfig();
-        NSMutableDictionary *listConfig = [gGridConfig[listID] mutableCopy] ?: [NSMutableDictionary new];
-        listConfig[iconID] = @(index);
-        gGridConfig[listID] = listConfig;
-        SaveGridConfig();
-    }
-    return result;
-}
-
-- (void)removeIcon:(id)icon gridCellInfoOptions:(unsigned long long)options mutationOptions:(unsigned long long)mutOptions {
-    %orig;
-    
-    NSString *listID = [self uniqueIdentifier];
-    NSString *iconID = GetIconID(icon);
-    
-    // 移除图标时，同步从 Plist 中删掉记录
-    if (listID && iconID) {
-        LoadGridConfig();
-        NSMutableDictionary *listConfig = [gGridConfig[listID] mutableCopy];
-        if (listConfig && listConfig[iconID]) {
-            [listConfig removeObjectForKey:iconID];
+    // atIndex 是顺序 index，尽量也记录（用当前 grid 位置）
+    if (!icon || IsDockList(self)) return result;
+    unsigned long long gridIdx = [self fixedLocationForIcon:icon];
+    if (gridIdx != NSNotFound && gridIdx < [self maxNumberOfIcons]) {
+        NSString *listID = [self uniqueIdentifier];
+        NSString *iconID = GetIconID(icon);
+        if (listID && iconID) {
+            if ([self respondsToSelector:@selector(setFixedLocation:forIcon:options:)]) {
+                [self setFixedLocation:gridIdx forIcon:icon options:0];
+            }
+            LoadGridConfig();
+            NSMutableDictionary *listConfig = [gGridConfig[listID] mutableCopy] ?: [NSMutableDictionary new];
+            listConfig[iconID] = @(gridIdx);
             gGridConfig[listID] = listConfig;
             SaveGridConfig();
         }
     }
+    return result;
+}
+
+- (id)moveContainedIcon:(id)icon toGridCellIndex:(unsigned long long)index gridCellInfoOptions:(unsigned long long)options mutationOptions:(unsigned long long)mutationOptions {
+    id result = %orig;
+    if (!icon || index == NSNotFound || IsDockList(self)) return result;
+
+    NSString *listID = [self uniqueIdentifier];
+    NSString *iconID = GetIconID(icon);
+    if (listID && iconID && index < [self maxNumberOfIcons]) {
+        if ([self respondsToSelector:@selector(setFixedLocation:forIcon:options:)]) {
+            [self setFixedLocation:index forIcon:icon options:0];
+        } else {
+            [self setFixedLocation:index forIcon:icon];
+        }
+        LoadGridConfig();
+        NSMutableDictionary *listConfig = [gGridConfig[listID] mutableCopy] ?: [NSMutableDictionary new];
+        listConfig[iconID] = @(index);
+        gGridConfig[listID] = listConfig;
+        SaveGridConfig();
+    }
+    return result;
+}
+
+- (void)moveContainedIcon:(id)icon toIndex:(unsigned long long)index options:(unsigned long long)options {
+    %orig;
+    if (!icon || IsDockList(self)) return;
+    unsigned long long gridIdx = [self fixedLocationForIcon:icon];
+    if (gridIdx != NSNotFound && gridIdx < [self maxNumberOfIcons]) {
+        NSString *listID = [self uniqueIdentifier];
+        NSString *iconID = GetIconID(icon);
+        if (listID && iconID) {
+            if ([self respondsToSelector:@selector(setFixedLocation:forIcon:options:)]) {
+                [self setFixedLocation:gridIdx forIcon:icon options:0];
+            }
+            LoadGridConfig();
+            NSMutableDictionary *listConfig = [gGridConfig[listID] mutableCopy] ?: [NSMutableDictionary new];
+            listConfig[iconID] = @(gridIdx);
+            gGridConfig[listID] = listConfig;
+            SaveGridConfig();
+        }
+    }
+}
+
+// -------------------- 删除时同步清理 --------------------
+- (void)removeIcon:(id)icon {
+    %orig;
+    CleanupIconFromPlist(self, icon);
+}
+
+- (void)removeIcon:(id)icon options:(unsigned long long)options {
+    %orig;
+    CleanupIconFromPlist(self, icon);
+}
+
+- (void)removeIcon:(id)icon gridCellInfoOptions:(unsigned long long)options mutationOptions:(unsigned long long)mutationOptions {
+    %orig;
+    CleanupIconFromPlist(self, icon);
+}
+
+- (void)removeIconAtIndex:(unsigned long long)index {
+    id icon = (index < [self maxNumberOfIcons]) ? [self iconAtIndex:index] : nil;
+    %orig;
+    if (icon) CleanupIconFromPlist(self, icon);
+}
+
+- (void)removeIconAtIndex:(unsigned long long)index options:(unsigned long long)options {
+    id icon = (index < [self maxNumberOfIcons]) ? [self iconAtIndex:index] : nil;
+    %orig;
+    if (icon) CleanupIconFromPlist(self, icon);
+}
+
+static void CleanupIconFromPlist(SBIconListModel *model, id icon) {
+    if (!model || !icon) return;
+    NSString *listID = [model uniqueIdentifier];
+    NSString *iconID = GetIconID(icon);
+    if (!listID || !iconID) return;
+    LoadGridConfig();
+    NSMutableDictionary *listConfig = [gGridConfig[listID] mutableCopy];
+    if (listConfig && listConfig[iconID]) {
+        [listConfig removeObjectForKey:iconID];
+        if (listConfig.count == 0) {
+            [gGridConfig removeObjectForKey:listID];
+        } else {
+            gGridConfig[listID] = listConfig;
+        }
+        SaveGridConfig();
+    }
+}
+
+// -------------------- 重越狱后恢复坐标的关键入口 --------------------
+- (void)setIcons:(NSArray *)icons {
+    %orig;
+    ApplyFixedLocationsFromPlist(self);
+}
+
+- (id)setIcons:(id)icons gridCellInfoOptions:(unsigned long long)options {
+    id result = %orig;
+    ApplyFixedLocationsFromPlist(self);
+    return result;
+}
+
+- (id)setIcons:(id)icons gridCellInfoOptions:(unsigned long long)options mutationOptions:(unsigned long long)mutationOptions {
+    id result = %orig;
+    ApplyFixedLocationsFromPlist(self);
+    return result;
+}
+
+- (id)setIconsFromIconListModel:(id)model {
+    id result = %orig;
+    ApplyFixedLocationsFromPlist(self);
+    return result;
 }
 
 %end
