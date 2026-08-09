@@ -182,7 +182,37 @@ static BOOL IsDockList(SBIconListModel *model) {
     return NO;
 }
 
-// 只应用已经记录的用户移动位置（不主动快照原布局）
+// 关键保护：把当前所有图标的实际位置（含空隙）立即设为 Fixed（仅运行时，不写plist）
+// 这是防止拖动开始时弹回的唯一可靠方法
+static void LockCurrentLayoutAsFixed(SBIconListModel *model) {
+    if (!model || IsDockList(model)) return;
+
+    NSArray *icons = [model icons];
+    if (!icons.count) return;
+
+    unsigned long long max = [model maxNumberOfIcons];
+
+    for (id icon in icons) {
+        if (!icon) continue;
+
+        unsigned long long loc = NSNotFound;
+        if ([model respondsToSelector:@selector(gridCellIndexForIcon:gridCellInfoOptions:)]) {
+            loc = [model gridCellIndexForIcon:icon gridCellInfoOptions:0];
+        }
+        if (loc == NSNotFound || loc >= max) {
+            loc = [model indexForIcon:icon];
+        }
+        if (loc != NSNotFound && loc < max) {
+            if ([model respondsToSelector:@selector(setFixedLocation:forIcon:options:)]) {
+                [model setFixedLocation:loc forIcon:icon options:0];
+            } else {
+                [model setFixedLocation:loc forIcon:icon];
+            }
+        }
+    }
+}
+
+// 只应用用户真正移动过的位置（用于启动还原）
 static void ApplyUserMovedLocations(SBIconListModel *model) {
     if (!model || IsDockList(model)) return;
     NSString *listID = [model uniqueIdentifier];
@@ -232,7 +262,6 @@ static void CleanupIconFromPlist(SBIconListModel *model, id icon) {
     }
 }
 
-// 只记录用户真正拖动落地的图标
 static void RecordUserMovedIcon(SBIconListModel *model, id icon, unsigned long long index) {
     if (!model || !icon || index == NSNotFound || index >= [model maxNumberOfIcons] || IsDockList(model)) return;
 
@@ -268,28 +297,41 @@ static void RecordUserMovedIcon(SBIconListModel *model, id icon, unsigned long l
     return YES;
 }
 
+// 系统重建临时模型时，立刻把当前自由布局锁定为 Fixed
 - (void)regenerateTemporaryDisplayedModelIfNecessary {
     %orig;
     id model = [self respondsToSelector:@selector(model)] ? [self model] : nil;
-    if (model) ApplyUserMovedLocations(model);
+    if (model) {
+        LockCurrentLayoutAsFixed(model);
+        ApplyUserMovedLocations(model);
+    }
 }
 
 - (void)layoutIconsIfNeeded {
     %orig;
     id model = [self respondsToSelector:@selector(model)] ? [self model] : nil;
-    if (model) ApplyUserMovedLocations(model);
+    if (model) {
+        LockCurrentLayoutAsFixed(model);
+        ApplyUserMovedLocations(model);
+    }
 }
 
 - (void)layoutIconsIfNeeded:(double)arg1 {
     %orig;
     id model = [self respondsToSelector:@selector(model)] ? [self model] : nil;
-    if (model) ApplyUserMovedLocations(model);
+    if (model) {
+        LockCurrentLayoutAsFixed(model);
+        ApplyUserMovedLocations(model);
+    }
 }
 
 - (void)layoutIconsIfNeeded:(double)arg1 animationType:(long long)arg2 options:(unsigned long long)arg3 {
     %orig;
     id model = [self respondsToSelector:@selector(model)] ? [self model] : nil;
-    if (model) ApplyUserMovedLocations(model);
+    if (model) {
+        LockCurrentLayoutAsFixed(model);
+        ApplyUserMovedLocations(model);
+    }
 }
 
 %end
@@ -333,7 +375,6 @@ static void RecordUserMovedIcon(SBIconListModel *model, id icon, unsigned long l
     return YES;
 }
 
-// 运行时强制所有图标 Fixed（防止拖动时弹回），但只持久化用户移动过的
 - (BOOL)isIconFixed:(id)icon {
     if (!icon || IsDockList(self)) return %orig;
     return YES;
@@ -364,7 +405,6 @@ static void RecordUserMovedIcon(SBIconListModel *model, id icon, unsigned long l
         }
     }
 
-    // 没有记录的图标，用当前实际位置作为 Fixed
     unsigned long long loc = NSNotFound;
     if ([self respondsToSelector:@selector(gridCellIndexForIcon:gridCellInfoOptions:)]) {
         loc = [self gridCellIndexForIcon:icon gridCellInfoOptions:0];
