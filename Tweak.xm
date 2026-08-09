@@ -3,7 +3,7 @@
 #import <objc/runtime.h>
 
 // ===================================================================
-// 完整结构体定义（解决 incomplete type 错误）
+// 完整结构体定义
 // ===================================================================
 struct SBHIconGridSize {
     unsigned short columns;
@@ -16,7 +16,7 @@ struct SBHIconGridRange {
 };
 
 // ===================================================================
-// 1. 接口声明
+// 接口声明
 // ===================================================================
 @interface SBIcon : NSObject
 - (NSString *)leafIdentifier;
@@ -35,6 +35,7 @@ struct SBHIconGridRange {
 - (NSArray *)icons;
 - (id)iconAtIndex:(unsigned long long)index;
 - (unsigned long long)indexForIcon:(id)icon;
+- (unsigned long long)gridCellIndexForIcon:(id)icon gridCellInfoOptions:(unsigned long long)options;
 - (BOOL)allowsFixedIconLocations;
 - (long long)fixedIconLocationBehavior;
 - (BOOL)isIconFixed:(id)icon;
@@ -75,7 +76,7 @@ struct SBHIconGridRange {
 @end
 
 // ===================================================================
-// 2. 坐标管理引擎（rootless / roothide 友好）
+// 坐标管理引擎
 // ===================================================================
 #define PLIST_PATH @"/var/mobile/Library/Preferences/com.freegrid.layout.plist"
 
@@ -130,14 +131,65 @@ static NSString *GetIconID(id icon) {
     return [NSString stringWithFormat:@"%p", icon];
 }
 
+static BOOL IsDockList(SBIconListModel *model) {
+    return NO; // Dock 由 View 层保护
+}
+
+// 首次安装：完整快照当前布局作为基线
+static void SnapshotCurrentLayoutIfNeeded(SBIconListModel *model) {
+    if (!model || IsDockList(model)) return;
+    NSString *listID = [model uniqueIdentifier];
+    if (!listID.length) return;
+
+    LoadGridConfig();
+    if (gGridConfig[listID]) return; // 已有配置，不重复快照
+
+    NSArray *icons = [model icons];
+    if (!icons.count) return;
+
+    NSMutableDictionary *listConfig = [NSMutableDictionary new];
+    unsigned long long max = [model maxNumberOfIcons];
+
+    for (id icon in icons) {
+        NSString *iconID = GetIconID(icon);
+        if (!iconID) continue;
+
+        unsigned long long loc = NSNotFound;
+        if ([model respondsToSelector:@selector(gridCellIndexForIcon:gridCellInfoOptions:)]) {
+            loc = [model gridCellIndexForIcon:icon gridCellInfoOptions:0];
+        }
+        if (loc == NSNotFound || loc >= max) {
+            loc = [model indexForIcon:icon];
+        }
+        if (loc != NSNotFound && loc < max) {
+            listConfig[iconID] = @(loc);
+            // 同步写入系统 Fixed 字典
+            if ([model respondsToSelector:@selector(setFixedLocation:forIcon:options:)]) {
+                [model setFixedLocation:loc forIcon:icon options:0];
+            } else {
+                [model setFixedLocation:loc forIcon:icon];
+            }
+        }
+    }
+
+    if (listConfig.count) {
+        gGridConfig[listID] = listConfig;
+        SaveGridConfig();
+    }
+}
+
 static void ApplyFixedLocationsFromPlist(SBIconListModel *model) {
-    if (!model) return;
+    if (!model || IsDockList(model)) return;
     NSString *listID = [model uniqueIdentifier];
     if (!listID.length) return;
 
     LoadGridConfig();
     NSDictionary *listConfig = gGridConfig[listID];
-    if (!listConfig.count) return;
+    if (!listConfig.count) {
+        // 没有配置 → 触发首次全量快照
+        SnapshotCurrentLayoutIfNeeded(model);
+        return;
+    }
 
     NSArray *icons = [model icons];
     if (!icons.count) return;
@@ -158,13 +210,6 @@ static void ApplyFixedLocationsFromPlist(SBIconListModel *model) {
     }
 }
 
-static BOOL IsDockList(SBIconListModel *model) {
-    return NO; // Dock 由 View 层 allowsGaps 保护
-}
-
-// 提前声明，解决 undeclared identifier
-static void CleanupIconFromPlist(SBIconListModel *model, id icon);
-
 static void CleanupIconFromPlist(SBIconListModel *model, id icon) {
     if (!model || !icon) return;
     NSString *listID = [model uniqueIdentifier];
@@ -184,7 +229,7 @@ static void CleanupIconFromPlist(SBIconListModel *model, id icon) {
 }
 
 // ===================================================================
-// 3. 视图层
+// 视图层
 // ===================================================================
 %hook SBIconListView
 
@@ -201,7 +246,7 @@ static void CleanupIconFromPlist(SBIconListModel *model, id icon) {
 %end
 
 // ===================================================================
-// 4. 数据层（完整防御）
+// 数据层（完整防御 + 首次快照）
 // ===================================================================
 %hook SBIconListModel
 
@@ -219,14 +264,7 @@ static void CleanupIconFromPlist(SBIconListModel *model, id icon) {
 
 - (BOOL)isIconFixed:(id)icon {
     if (!icon || IsDockList(self)) return %orig;
-    NSString *listID = [self uniqueIdentifier];
-    NSString *iconID = GetIconID(icon);
-    if (listID && iconID) {
-        LoadGridConfig();
-        NSDictionary *cfg = gGridConfig[listID];
-        if (cfg && cfg[iconID]) return YES;
-    }
-    return YES; // 强制所有图标视为 Fixed，彻底禁止自动排序
+    return YES; // 强制全部视为 Fixed
 }
 
 - (BOOL)isIconFixed:(id)icon gridCellInfoOptions:(unsigned long long)options {
@@ -235,79 +273,74 @@ static void CleanupIconFromPlist(SBIconListModel *model, id icon) {
 
 - (unsigned long long)fixedLocationForIcon:(id)icon {
     if (!icon || IsDockList(self)) return %orig;
+
     NSString *listID = [self uniqueIdentifier];
     NSString *iconID = GetIconID(icon);
-    if (listID && iconID) {
-        LoadGridConfig();
-        NSDictionary *cfg = gGridConfig[listID];
-        if (cfg && cfg[iconID]) {
-            unsigned long long loc = [cfg[iconID] unsignedLongLongValue];
-            if (loc < [self maxNumberOfIcons]) return loc;
+    if (!listID || !iconID) return %orig;
+
+    LoadGridConfig();
+    NSDictionary *cfg = gGridConfig[listID];
+    if (cfg && cfg[iconID]) {
+        unsigned long long loc = [cfg[iconID] unsignedLongLongValue];
+        if (loc < [self maxNumberOfIcons]) {
+            // 确保内部字典也同步
+            if ([self respondsToSelector:@selector(setFixedLocation:forIcon:options:)]) {
+                [self setFixedLocation:loc forIcon:icon options:0];
+            }
+            return loc;
         }
     }
-    unsigned long long idx = [self indexForIcon:icon];
-    if (idx != NSNotFound) return idx;
+
+    // 没有记录 → 获取当前真实位置并立即记录（首次快照的补充）
+    unsigned long long loc = NSNotFound;
+    if ([self respondsToSelector:@selector(gridCellIndexForIcon:gridCellInfoOptions:)]) {
+        loc = [self gridCellIndexForIcon:icon gridCellInfoOptions:0];
+    }
+    if (loc == NSNotFound || loc >= [self maxNumberOfIcons]) {
+        loc = [self indexForIcon:icon];
+    }
+    if (loc != NSNotFound && loc < [self maxNumberOfIcons]) {
+        NSMutableDictionary *listConfig = [gGridConfig[listID] mutableCopy] ?: [NSMutableDictionary new];
+        listConfig[iconID] = @(loc);
+        gGridConfig[listID] = listConfig;
+        SaveGridConfig();
+        if ([self respondsToSelector:@selector(setFixedLocation:forIcon:options:)]) {
+            [self setFixedLocation:loc forIcon:icon options:0];
+        } else {
+            [self setFixedLocation:loc forIcon:icon];
+        }
+        return loc;
+    }
     return %orig;
 }
 
-- (void)removeAllFixedIconLocations {
-}
+- (void)removeAllFixedIconLocations {}
+- (void)removeFixedIconLocationForIcon:(id)icon {}
+- (void)removeFixedIconLocationsForIcons:(id)icons {}
+- (void)removeFixedIconLocationsForIconsInGridRange:(struct SBHIconGridRange)range gridCellInfo:(id)info {}
+- (void)removeFixedIconLocationsForIconsInGridRange:(struct SBHIconGridRange)range gridCellInfoOptions:(unsigned long long)options {}
 
-- (void)removeFixedIconLocationForIcon:(id)icon {
-}
+- (id)_updateModelByRepairingGapsIfNecessary { return nil; }
+- (id)_updateModelByRepairingGapsIfNecessaryAvoidingIcons:(id)icons { return nil; }
+- (id)repairModelByEliminatingGapsInIcons:(id)icons avoidingIcons:(id)avoiding { return icons; }
 
-- (void)removeFixedIconLocationsForIcons:(id)icons {
-}
-
-- (void)removeFixedIconLocationsForIconsInGridRange:(struct SBHIconGridRange)range gridCellInfo:(id)info {
-}
-
-- (void)removeFixedIconLocationsForIconsInGridRange:(struct SBHIconGridRange)range gridCellInfoOptions:(unsigned long long)options {
-}
-
-- (id)_updateModelByRepairingGapsIfNecessary {
-    return nil;
-}
-
-- (id)_updateModelByRepairingGapsIfNecessaryAvoidingIcons:(id)icons {
-    return nil;
-}
-
-- (id)repairModelByEliminatingGapsInIcons:(id)icons avoidingIcons:(id)avoiding {
-    return icons;
-}
-
-- (BOOL)isGridLayoutValid {
-    return YES;
-}
-
-- (BOOL)isGridLayoutValid:(id)info {
-    return YES;
-}
-
-- (BOOL)isGridLayoutValidWithOptions:(unsigned long long)options {
-    return YES;
-}
-
+- (BOOL)isGridLayoutValid { return YES; }
+- (BOOL)isGridLayoutValid:(id)info { return YES; }
+- (BOOL)isGridLayoutValidWithOptions:(unsigned long long)options { return YES; }
 - (BOOL)isGridLayoutValidWithOptions:(unsigned long long)options outOfBoundsIcons:(id *)outIcons {
     if (outIcons) *outIcons = nil;
     return YES;
 }
-
-- (BOOL)canUseFastGridLayoutValidity {
-    return NO;
-}
+- (BOOL)canUseFastGridLayoutValidity { return NO; }
 
 - (unsigned long long)bestGridCellIndexForInsertingIcon:(id)icon atGridCellIndex:(unsigned long long)index {
     if (index != NSNotFound && index < [self maxNumberOfIcons]) return index;
     return %orig;
 }
-
 - (unsigned long long)bestGridCellIndexForInsertingIcon:(id)icon atGridCellIndex:(unsigned long long)index gridCellInfoOptions:(unsigned long long)options {
     if (index != NSNotFound && index < [self maxNumberOfIcons]) return index;
     return %orig;
 }
-
 - (unsigned long long)bestGridCellIndexForInsertingIcon:(id)icon atGridCellIndex:(unsigned long long)index gridCellInfo:(id)info {
     if (index != NSNotFound && index < [self maxNumberOfIcons]) return index;
     return %orig;
@@ -316,7 +349,6 @@ static void CleanupIconFromPlist(SBIconListModel *model, id icon) {
 - (id)insertIcon:(id)icon atGridCellIndex:(unsigned long long)index gridCellInfoOptions:(unsigned long long)options mutationOptions:(unsigned long long)mutationOptions {
     id result = %orig;
     if (!icon || index == NSNotFound || IsDockList(self)) return result;
-
     NSString *listID = [self uniqueIdentifier];
     NSString *iconID = GetIconID(icon);
     if (listID && iconID && index < [self maxNumberOfIcons]) {
@@ -358,7 +390,6 @@ static void CleanupIconFromPlist(SBIconListModel *model, id icon) {
 - (id)moveContainedIcon:(id)icon toGridCellIndex:(unsigned long long)index gridCellInfoOptions:(unsigned long long)options mutationOptions:(unsigned long long)mutationOptions {
     id result = %orig;
     if (!icon || index == NSNotFound || IsDockList(self)) return result;
-
     NSString *listID = [self uniqueIdentifier];
     NSString *iconID = GetIconID(icon);
     if (listID && iconID && index < [self maxNumberOfIcons]) {
@@ -400,23 +431,19 @@ static void CleanupIconFromPlist(SBIconListModel *model, id icon) {
     %orig;
     CleanupIconFromPlist(self, icon);
 }
-
 - (void)removeIcon:(id)icon options:(unsigned long long)options {
     %orig;
     CleanupIconFromPlist(self, icon);
 }
-
 - (void)removeIcon:(id)icon gridCellInfoOptions:(unsigned long long)options mutationOptions:(unsigned long long)mutationOptions {
     %orig;
     CleanupIconFromPlist(self, icon);
 }
-
 - (void)removeIconAtIndex:(unsigned long long)index {
     id icon = (index < [self maxNumberOfIcons]) ? [self iconAtIndex:index] : nil;
     %orig;
     if (icon) CleanupIconFromPlist(self, icon);
 }
-
 - (void)removeIconAtIndex:(unsigned long long)index options:(unsigned long long)options {
     id icon = (index < [self maxNumberOfIcons]) ? [self iconAtIndex:index] : nil;
     %orig;
@@ -427,19 +454,16 @@ static void CleanupIconFromPlist(SBIconListModel *model, id icon) {
     %orig;
     ApplyFixedLocationsFromPlist(self);
 }
-
 - (id)setIcons:(id)icons gridCellInfoOptions:(unsigned long long)options {
     id result = %orig;
     ApplyFixedLocationsFromPlist(self);
     return result;
 }
-
 - (id)setIcons:(id)icons gridCellInfoOptions:(unsigned long long)options mutationOptions:(unsigned long long)mutationOptions {
     id result = %orig;
     ApplyFixedLocationsFromPlist(self);
     return result;
 }
-
 - (id)setIconsFromIconListModel:(id)model {
     id result = %orig;
     ApplyFixedLocationsFromPlist(self);
