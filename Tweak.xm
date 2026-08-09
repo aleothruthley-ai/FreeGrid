@@ -91,7 +91,7 @@ struct SBHIconGridRange {
 @end
 
 // ===================================================================
-// 坐标管理引擎（只记录用户移动过的图标）
+// 坐标管理引擎（只记录用户真正移动过的图标）
 // ===================================================================
 #define PLIST_PATH @"/var/mobile/Library/Preferences/com.freegrid.layout.plist"
 
@@ -177,7 +177,7 @@ static BOOL IsDockList(SBIconListModel *model) {
     return NO;
 }
 
-// 只应用已经记录过的用户移动图标，绝不主动快照原有布局
+// 只把已经记录的用户移动图标重新写回 Fixed，绝不碰没动过的图标
 static void ApplyUserMovedLocations(SBIconListModel *model) {
     if (!model || IsDockList(model)) return;
     NSString *listID = [model uniqueIdentifier];
@@ -196,7 +196,7 @@ static void ApplyUserMovedLocations(SBIconListModel *model) {
         NSString *iconID = GetIconID(icon);
         if (!iconID) continue;
         NSNumber *num = listConfig[iconID];
-        if (!num) continue;                     // 没记录过的图标完全不管
+        if (!num) continue;
         unsigned long long loc = [num unsignedLongLongValue];
         if (loc >= max) continue;
 
@@ -227,7 +227,7 @@ static void CleanupIconFromPlist(SBIconListModel *model, id icon) {
     }
 }
 
-// 只在用户真正移动图标时调用，记录这个图标的新位置
+// 用户真正拖动落地时才记录
 static void RecordUserMovedIcon(SBIconListModel *model, id icon, unsigned long long index) {
     if (!model || !icon || index == NSNotFound || index >= [model maxNumberOfIcons] || IsDockList(model)) return;
 
@@ -235,14 +235,12 @@ static void RecordUserMovedIcon(SBIconListModel *model, id icon, unsigned long l
     NSString *iconID = GetIconID(icon);
     if (!listID || !iconID) return;
 
-    // 立即把这个图标设为 Fixed
     if ([model respondsToSelector:@selector(setFixedLocation:forIcon:options:)]) {
         [model setFixedLocation:index forIcon:icon options:0];
     } else {
         [model setFixedLocation:index forIcon:icon];
     }
 
-    // 只写入这一个图标
     LoadGridConfig();
     NSMutableDictionary *listConfig = [gGridConfig[listID] mutableCopy] ?: [NSMutableDictionary new];
     listConfig[iconID] = @(index);
@@ -306,7 +304,8 @@ static void RecordUserMovedIcon(SBIconListModel *model, id icon, unsigned long l
     return YES;
 }
 
-// 只有用户移动过、被记录的图标才强制 Fixed，其余走系统原逻辑
+// 关键：每次被查询时，如果这个图标有记录，就重新强制 setFixedLocation
+// 防止系统在重建临时模型时把位置丢掉
 - (BOOL)isIconFixed:(id)icon {
     if (!icon || IsDockList(self)) return %orig;
 
@@ -317,7 +316,15 @@ static void RecordUserMovedIcon(SBIconListModel *model, id icon, unsigned long l
     LoadGridConfig();
     NSDictionary *cfg = gGridConfig[listID];
     if (cfg && cfg[iconID]) {
-        return YES;
+        unsigned long long loc = [cfg[iconID] unsignedLongLongValue];
+        if (loc < [self maxNumberOfIcons]) {
+            if ([self respondsToSelector:@selector(setFixedLocation:forIcon:options:)]) {
+                [self setFixedLocation:loc forIcon:icon options:0];
+            } else {
+                [self setFixedLocation:loc forIcon:icon];
+            }
+            return YES;
+        }
     }
     return %orig;
 }
@@ -338,8 +345,11 @@ static void RecordUserMovedIcon(SBIconListModel *model, id icon, unsigned long l
     if (cfg && cfg[iconID]) {
         unsigned long long loc = [cfg[iconID] unsignedLongLongValue];
         if (loc < [self maxNumberOfIcons]) {
+            // 每次查询都重新强制写一次，保证临时模型不会丢
             if ([self respondsToSelector:@selector(setFixedLocation:forIcon:options:)]) {
                 [self setFixedLocation:loc forIcon:icon options:0];
+            } else {
+                [self setFixedLocation:loc forIcon:icon];
             }
             return loc;
         }
@@ -379,7 +389,6 @@ static void RecordUserMovedIcon(SBIconListModel *model, id icon, unsigned long l
     return %orig;
 }
 
-// 用户拖动真正落地时才记录
 - (id)insertIcon:(id)icon atGridCellIndex:(unsigned long long)index gridCellInfoOptions:(unsigned long long)options mutationOptions:(unsigned long long)mutationOptions {
     id result = %orig;
     RecordUserMovedIcon(self, icon, index);
@@ -388,7 +397,6 @@ static void RecordUserMovedIcon(SBIconListModel *model, id icon, unsigned long l
 
 - (id)insertIcon:(id)icon atIndex:(unsigned long long)index options:(unsigned long long)options {
     id result = %orig;
-    // atIndex 路径主要是系统内部/反序列化，不强制记录
     return result;
 }
 
@@ -400,7 +408,6 @@ static void RecordUserMovedIcon(SBIconListModel *model, id icon, unsigned long l
 
 - (void)moveContainedIcon:(id)icon toIndex:(unsigned long long)index options:(unsigned long long)options {
     %orig;
-    // 系统内部路径，不强制记录
 }
 
 - (void)removeIcon:(id)icon {
