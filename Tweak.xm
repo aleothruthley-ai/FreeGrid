@@ -3,7 +3,7 @@
 #import <objc/runtime.h>
 
 // ===================================================================
-// 结构体定义
+// 结构体
 // ===================================================================
 struct SBHIconGridSize {
     unsigned short columns;
@@ -16,7 +16,7 @@ struct SBHIconGridRange {
 };
 
 // ===================================================================
-// 接口声明
+// 接口声明（兼容 17.0 / 17.2）
 // ===================================================================
 @interface SBIcon : NSObject
 - (NSString *)leafIdentifier;
@@ -26,6 +26,8 @@ struct SBHIconGridRange {
 
 @interface SBFolderIcon : SBIcon
 - (id)folder;
+- (id)nodeIdentifier;
+- (BOOL)isFolderIcon;
 @end
 
 @interface SBFolder : NSObject
@@ -36,6 +38,7 @@ struct SBHIconGridRange {
 @interface SBIconListView : UIView
 - (NSString *)iconLocation;
 - (BOOL)allowsGaps;
+- (BOOL)isDock;
 @end
 
 @interface SBIconListModel : NSObject
@@ -53,8 +56,6 @@ struct SBHIconGridRange {
 - (void)setFixedLocation:(unsigned long long)location forIcon:(id)icon;
 - (void)setFixedLocation:(unsigned long long)location forIcon:(id)icon options:(unsigned long long)options;
 - (void)saveCurrentIconLocationsAsFixed;
-- (void)saveOnlyRequiredIconLocationsAsFixed;
-- (void)saveOnlyRequiredIconLocationsAsFixedIfRequired;
 - (void)removeAllFixedIconLocations;
 - (void)removeFixedIconLocationForIcon:(id)icon;
 - (void)removeFixedIconLocationsForIcons:(id)icons;
@@ -94,13 +95,28 @@ struct SBHIconGridRange {
 - (void)ensureFixedIconLocationsIfNecessary;
 @end
 
+@interface SBIconDragManager : NSObject
+- (BOOL)isIconDragging;
+- (BOOL)isTrackingActiveOrDroppingIconDrags;
+- (BOOL)isTrackingDroppingIconDrags;
+- (BOOL)isTrackingUserActiveIconDrags;
+- (void)iconViewWillBeginDrag:(id)iconView session:(id)session;
+- (void)iconDropSessionDidEnd:(id)session;
+- (void)iconDropSessionDidEnd:(id)session identifier:(id)identifier draggedIconIdentifiers:(id)identifiers;
+- (void)concludeIconDrop:(id)drop;
+- (void)performIconDrop:(id)drop inIconListView:(id)view;
+- (void)cancelAllDrags;
+- (void)cancelEditingAndAllDrags;
+@end
+
 // ===================================================================
-// 坐标管理引擎
+// 全局状态 & 坐标引擎
 // ===================================================================
 #define PLIST_PATH @"/var/mobile/Library/Preferences/com.freegrid.layout.plist"
 
 static NSMutableDictionary *gGridConfig = nil;
 static dispatch_queue_t gSaveQueue;
+static BOOL gIsDragging = NO;   // 关键：拖动过程中不强制干预
 
 static void EnsureSaveQueue(void) {
     static dispatch_once_t onceToken;
@@ -133,27 +149,20 @@ static void SaveGridConfig(void) {
     });
 }
 
-// 强化版 ID 获取（重点支持文件夹）
+// 强化文件夹支持
 static NSString *GetIconID(id icon) {
     if (!icon) return nil;
 
-    // 1. 优先 leafIdentifier（普通 App 和大部分文件夹都有）
-    if ([icon respondsToSelector:@selector(leafIdentifier)]) {
-        NSString *leaf = [icon leafIdentifier];
-        if (leaf.length > 0) return leaf;
-    }
-
-    // 2. 文件夹专用：尝试 nodeIdentifier
-    if ([icon respondsToSelector:@selector(nodeIdentifier)]) {
-        id node = [icon nodeIdentifier];
-        if ([node isKindOfClass:[NSString class]] && [(NSString *)node length] > 0) {
-            return (NSString *)node;
-        }
-    }
-
-    // 3. 文件夹再尝试 folder.uniqueIdentifier
     Class folderIconClass = objc_getClass("SBFolderIcon");
     if (folderIconClass && [icon isKindOfClass:folderIconClass]) {
+        // 1. nodeIdentifier 最稳定
+        if ([icon respondsToSelector:@selector(nodeIdentifier)]) {
+            id node = [icon nodeIdentifier];
+            if ([node isKindOfClass:[NSString class]] && [(NSString *)node length] > 0) {
+                return (NSString *)node;
+            }
+        }
+        // 2. folder.uniqueIdentifier
         if ([icon respondsToSelector:@selector(folder)]) {
             id folder = [icon folder];
             if (folder && [folder respondsToSelector:@selector(uniqueIdentifier)]) {
@@ -162,28 +171,30 @@ static NSString *GetIconID(id icon) {
                     return [@"folder:" stringByAppendingString:uid];
                 }
             }
-            // 备用：用显示名 + 指针（极端情况）
-            if (folder && [folder respondsToSelector:@selector(displayName)]) {
-                NSString *name = [folder displayName];
-                if (name.length > 0) {
-                    return [NSString stringWithFormat:@"folder-name:%@-%p", name, icon];
-                }
-            }
         }
     }
 
-    // 4. App Bundle ID
+    // 普通图标
+    if ([icon respondsToSelector:@selector(leafIdentifier)]) {
+        NSString *leaf = [icon leafIdentifier];
+        if (leaf.length > 0) return leaf;
+    }
     if ([icon respondsToSelector:@selector(applicationBundleIdentifier)]) {
         NSString *bid = [icon applicationBundleIdentifier];
         if (bid.length > 0) return bid;
     }
+    if ([icon respondsToSelector:@selector(nodeIdentifier)]) {
+        id node = [icon nodeIdentifier];
+        if ([node isKindOfClass:[NSString class]] && [(NSString *)node length] > 0) {
+            return (NSString *)node;
+        }
+    }
 
-    // 5. 最终兜底
     return [NSString stringWithFormat:@"icon-%p", icon];
 }
 
 static BOOL IsDockList(SBIconListModel *model) {
-    return NO;
+    return NO; // 如需排除 Dock 可在这里加判断
 }
 
 static void SnapshotCurrentLayoutIfNeeded(SBIconListModel *model) {
@@ -228,7 +239,7 @@ static void SnapshotCurrentLayoutIfNeeded(SBIconListModel *model) {
 }
 
 static void ApplyFixedLocationsFromPlist(SBIconListModel *model) {
-    if (!model || IsDockList(model)) return;
+    if (!model || IsDockList(model) || gIsDragging) return; // 拖动中不强制
     NSString *listID = [model uniqueIdentifier];
     if (!listID.length) return;
 
@@ -281,6 +292,7 @@ static void CleanupIconFromPlist(SBIconListModel *model, id icon) {
 
 static void ForceSaveFixedLocation(SBIconListModel *model, id icon, unsigned long long index) {
     if (!model || !icon || index == NSNotFound || index >= [model maxNumberOfIcons] || IsDockList(model)) return;
+    if (gIsDragging) return; // 拖动过程中不保存，等松手再保存
 
     NSString *listID = [model uniqueIdentifier];
     NSString *iconID = GetIconID(icon);
@@ -298,9 +310,58 @@ static void ForceSaveFixedLocation(SBIconListModel *model, id icon, unsigned lon
     gGridConfig[listID] = listConfig;
     SaveGridConfig();
 
-    // 立刻全量拉回，防止其它图标（包括文件夹）乱动
+    // 只在非拖动时全量拉回，防止其它图标（含文件夹）乱动
     ApplyFixedLocationsFromPlist(model);
 }
+
+// ===================================================================
+// 拖动状态控制（恢复原生手感关键）
+// ===================================================================
+%hook SBIconDragManager
+
+- (void)iconViewWillBeginDrag:(id)iconView session:(id)session {
+    gIsDragging = YES;
+    %orig;
+}
+
+- (void)iconDropSessionDidEnd:(id)session {
+    gIsDragging = NO;
+    %orig;
+}
+
+- (void)iconDropSessionDidEnd:(id)session identifier:(id)identifier draggedIconIdentifiers:(id)identifiers {
+    gIsDragging = NO;
+    %orig;
+}
+
+- (void)concludeIconDrop:(id)drop {
+    gIsDragging = NO;
+    %orig;
+}
+
+- (void)performIconDrop:(id)drop inIconListView:(id)view {
+    %orig;
+    // 松手后立即把当前布局写进固定位置
+    if ([view respondsToSelector:@selector(model)]) {
+        id model = [view model];
+        if (model) {
+            ApplyFixedLocationsFromPlist(model);
+        }
+    }
+    gIsDragging = NO;
+}
+
+- (void)cancelAllDrags {
+    gIsDragging = NO;
+    %orig;
+}
+
+- (void)cancelEditingAndAllDrags {
+    gIsDragging = NO;
+    %orig;
+}
+
+%end
 
 // ===================================================================
 // 视图层
@@ -308,6 +369,9 @@ static void ForceSaveFixedLocation(SBIconListModel *model, id icon, unsigned lon
 %hook SBIconListView
 
 - (BOOL)allowsGaps {
+    if ([self respondsToSelector:@selector(isDock)] && [self isDock]) {
+        return %orig;
+    }
     if ([self respondsToSelector:@selector(iconLocation)]) {
         NSString *location = [self iconLocation];
         if (location && ([location containsString:@"Dock"] || [location containsString:@"dock"])) {
@@ -342,7 +406,7 @@ static void ForceSaveFixedLocation(SBIconListModel *model, id icon, unsigned lon
 %end
 
 // ===================================================================
-// 数据层
+// 数据层（核心）
 // ===================================================================
 %hook SBIconListModel
 
@@ -360,6 +424,8 @@ static void ForceSaveFixedLocation(SBIconListModel *model, id icon, unsigned lon
 
 - (BOOL)isIconFixed:(id)icon {
     if (!icon || IsDockList(self)) return %orig;
+    // 拖动中返回系统原值，避免干扰动画
+    if (gIsDragging) return %orig;
     return YES;
 }
 
@@ -368,7 +434,7 @@ static void ForceSaveFixedLocation(SBIconListModel *model, id icon, unsigned lon
 }
 
 - (unsigned long long)fixedLocationForIcon:(id)icon {
-    if (!icon || IsDockList(self)) return %orig;
+    if (!icon || IsDockList(self) || gIsDragging) return %orig;
 
     NSString *listID = [self uniqueIdentifier];
     NSString *iconID = GetIconID(icon);
@@ -406,58 +472,91 @@ static void ForceSaveFixedLocation(SBIconListModel *model, id icon, unsigned lon
 - (void)removeFixedIconLocationsForIconsInGridRange:(struct SBHIconGridRange)range gridCellInfo:(id)info {}
 - (void)removeFixedIconLocationsForIconsInGridRange:(struct SBHIconGridRange)range gridCellInfoOptions:(unsigned long long)options {}
 
-- (id)_updateModelByRepairingGapsIfNecessary { return nil; }
-- (id)_updateModelByRepairingGapsIfNecessaryAvoidingIcons:(id)icons { return nil; }
-- (id)repairModelByEliminatingGapsInIcons:(id)icons avoidingIcons:(id)avoiding { return icons; }
+- (id)_updateModelByRepairingGapsIfNecessary {
+    if (gIsDragging) return %orig;
+    return nil;
+}
+- (id)_updateModelByRepairingGapsIfNecessaryAvoidingIcons:(id)icons {
+    if (gIsDragging) return %orig;
+    return nil;
+}
+- (id)repairModelByEliminatingGapsInIcons:(id)icons avoidingIcons:(id)avoiding {
+    if (gIsDragging) return %orig;
+    return icons;
+}
 
-- (BOOL)isGridLayoutValid { return YES; }
-- (BOOL)isGridLayoutValid:(id)info { return YES; }
-- (BOOL)isGridLayoutValidWithOptions:(unsigned long long)options { return YES; }
+- (BOOL)isGridLayoutValid {
+    if (gIsDragging) return %orig;
+    return YES;
+}
+- (BOOL)isGridLayoutValid:(id)info {
+    if (gIsDragging) return %orig;
+    return YES;
+}
+- (BOOL)isGridLayoutValidWithOptions:(unsigned long long)options {
+    if (gIsDragging) return %orig;
+    return YES;
+}
 - (BOOL)isGridLayoutValidWithOptions:(unsigned long long)options outOfBoundsIcons:(id *)outIcons {
+    if (gIsDragging) return %orig;
     if (outIcons) *outIcons = nil;
     return YES;
 }
-- (BOOL)canUseFastGridLayoutValidity { return NO; }
+- (BOOL)canUseFastGridLayoutValidity {
+    return NO;
+}
 
+// 拖动中不强制返回固定 index，让系统自己算插入点（恢复原生手感）
 - (unsigned long long)bestGridCellIndexForInsertingIcon:(id)icon atGridCellIndex:(unsigned long long)index {
+    if (gIsDragging) return %orig;
     if (index != NSNotFound && index < [self maxNumberOfIcons]) return index;
     return %orig;
 }
 - (unsigned long long)bestGridCellIndexForInsertingIcon:(id)icon atGridCellIndex:(unsigned long long)index gridCellInfoOptions:(unsigned long long)options {
+    if (gIsDragging) return %orig;
     if (index != NSNotFound && index < [self maxNumberOfIcons]) return index;
     return %orig;
 }
 - (unsigned long long)bestGridCellIndexForInsertingIcon:(id)icon atGridCellIndex:(unsigned long long)index gridCellInfo:(id)info {
+    if (gIsDragging) return %orig;
     if (index != NSNotFound && index < [self maxNumberOfIcons]) return index;
     return %orig;
 }
 
 - (id)insertIcon:(id)icon atGridCellIndex:(unsigned long long)index gridCellInfoOptions:(unsigned long long)options mutationOptions:(unsigned long long)mutationOptions {
     id result = %orig;
-    ForceSaveFixedLocation(self, icon, index);
+    if (!gIsDragging) {
+        ForceSaveFixedLocation(self, icon, index);
+    }
     return result;
 }
 
 - (id)insertIcon:(id)icon atIndex:(unsigned long long)index options:(unsigned long long)options {
     id result = %orig;
-    unsigned long long gridIdx = [self fixedLocationForIcon:icon];
-    if (gridIdx != NSNotFound) {
-        ForceSaveFixedLocation(self, icon, gridIdx);
+    if (!gIsDragging) {
+        unsigned long long gridIdx = [self fixedLocationForIcon:icon];
+        if (gridIdx != NSNotFound) {
+            ForceSaveFixedLocation(self, icon, gridIdx);
+        }
     }
     return result;
 }
 
 - (id)moveContainedIcon:(id)icon toGridCellIndex:(unsigned long long)index gridCellInfoOptions:(unsigned long long)options mutationOptions:(unsigned long long)mutationOptions {
     id result = %orig;
-    ForceSaveFixedLocation(self, icon, index);
+    if (!gIsDragging) {
+        ForceSaveFixedLocation(self, icon, index);
+    }
     return result;
 }
 
 - (void)moveContainedIcon:(id)icon toIndex:(unsigned long long)index options:(unsigned long long)options {
     %orig;
-    unsigned long long gridIdx = [self fixedLocationForIcon:icon];
-    if (gridIdx != NSNotFound) {
-        ForceSaveFixedLocation(self, icon, gridIdx);
+    if (!gIsDragging) {
+        unsigned long long gridIdx = [self fixedLocationForIcon:icon];
+        if (gridIdx != NSNotFound) {
+            ForceSaveFixedLocation(self, icon, gridIdx);
+        }
     }
 }
 
@@ -486,21 +585,21 @@ static void ForceSaveFixedLocation(SBIconListModel *model, id icon, unsigned lon
 
 - (void)setIcons:(NSArray *)icons {
     %orig;
-    ApplyFixedLocationsFromPlist(self);
+    if (!gIsDragging) ApplyFixedLocationsFromPlist(self);
 }
 - (id)setIcons:(id)icons gridCellInfoOptions:(unsigned long long)options {
     id result = %orig;
-    ApplyFixedLocationsFromPlist(self);
+    if (!gIsDragging) ApplyFixedLocationsFromPlist(self);
     return result;
 }
 - (id)setIcons:(id)icons gridCellInfoOptions:(unsigned long long)options mutationOptions:(unsigned long long)mutationOptions {
     id result = %orig;
-    ApplyFixedLocationsFromPlist(self);
+    if (!gIsDragging) ApplyFixedLocationsFromPlist(self);
     return result;
 }
 - (id)setIconsFromIconListModel:(id)model {
     id result = %orig;
-    ApplyFixedLocationsFromPlist(self);
+    if (!gIsDragging) ApplyFixedLocationsFromPlist(self);
     return result;
 }
 
