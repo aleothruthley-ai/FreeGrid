@@ -145,7 +145,7 @@ static BOOL IsDockList(SBIconListModel *model) {
     return NO;
 }
 
-// 首次安装或列表为空时，完整快照当前布局
+// 首次安装完整快照
 static void SnapshotCurrentLayoutIfNeeded(SBIconListModel *model) {
     if (!model || IsDockList(model)) return;
     NSString *listID = [model uniqueIdentifier];
@@ -184,13 +184,10 @@ static void SnapshotCurrentLayoutIfNeeded(SBIconListModel *model) {
     if (listConfig.count) {
         gGridConfig[listID] = listConfig;
         SaveGridConfig();
-        if ([model respondsToSelector:@selector(saveCurrentIconLocationsAsFixed)]) {
-            [model saveCurrentIconLocationsAsFixed];
-        }
     }
 }
 
-// 把 plist 里的位置强制应用到 Model，并标记为 Fixed
+// 全量强制应用我们记录的位置（防止其它图标乱跑的关键）
 static void ApplyFixedLocationsFromPlist(SBIconListModel *model) {
     if (!model || IsDockList(model)) return;
     NSString *listID = [model uniqueIdentifier];
@@ -207,7 +204,6 @@ static void ApplyFixedLocationsFromPlist(SBIconListModel *model) {
     if (!icons.count) return;
 
     unsigned long long max = [model maxNumberOfIcons];
-    BOOL didSet = NO;
 
     for (id icon in icons) {
         NSString *iconID = GetIconID(icon);
@@ -222,11 +218,6 @@ static void ApplyFixedLocationsFromPlist(SBIconListModel *model) {
         } else {
             [model setFixedLocation:loc forIcon:icon];
         }
-        didSet = YES;
-    }
-
-    if (didSet && [model respondsToSelector:@selector(saveCurrentIconLocationsAsFixed)]) {
-        [model saveCurrentIconLocationsAsFixed];
     }
 }
 
@@ -249,7 +240,7 @@ static void CleanupIconFromPlist(SBIconListModel *model, id icon) {
     }
 }
 
-// 只更新单个图标的位置（不调用全量 save，避免触发其它图标重排）
+// 只更新单个图标位置，然后立刻全量拉回其它图标
 static void ForceSaveFixedLocation(SBIconListModel *model, id icon, unsigned long long index) {
     if (!model || !icon || index == NSNotFound || index >= [model maxNumberOfIcons] || IsDockList(model)) return;
 
@@ -257,19 +248,21 @@ static void ForceSaveFixedLocation(SBIconListModel *model, id icon, unsigned lon
     NSString *iconID = GetIconID(icon);
     if (!listID || !iconID) return;
 
-    // 写入系统 Fixed
+    // 先写入目标图标
     if ([model respondsToSelector:@selector(setFixedLocation:forIcon:options:)]) {
         [model setFixedLocation:index forIcon:icon options:0];
     } else {
         [model setFixedLocation:index forIcon:icon];
     }
 
-    // 写入我们的 plist
     LoadGridConfig();
     NSMutableDictionary *listConfig = [gGridConfig[listID] mutableCopy] ?: [NSMutableDictionary new];
     listConfig[iconID] = @(index);
     gGridConfig[listID] = listConfig;
     SaveGridConfig();
+
+    // 关键：立刻把所有其它图标强制拉回我们记录的位置，阻止乱动
+    ApplyFixedLocationsFromPlist(model);
 }
 
 // ===================================================================
@@ -307,7 +300,7 @@ static void ForceSaveFixedLocation(SBIconListModel *model, id icon, unsigned lon
 }
 
 - (void)ensureFixedIconLocationsIfNecessary {
-    // 空实现，防止系统重置
+    // 空实现
 }
 
 %end
@@ -329,7 +322,7 @@ static void ForceSaveFixedLocation(SBIconListModel *model, id icon, unsigned lon
     return YES;
 }
 
-// 关键：强制所有非 Dock 图标都视为 Fixed，彻底阻止其它图标自己乱动
+// 强制所有非 Dock 图标都是 Fixed
 - (BOOL)isIconFixed:(id)icon {
     if (!icon || IsDockList(self)) return %orig;
     return YES;
@@ -358,7 +351,7 @@ static void ForceSaveFixedLocation(SBIconListModel *model, id icon, unsigned lon
         }
     }
 
-    // 没有记录时，记录当前真实位置
+    // 没有记录时记录当前位置
     unsigned long long loc = NSNotFound;
     if ([self respondsToSelector:@selector(gridCellIndexForIcon:gridCellInfoOptions:)]) {
         loc = [self gridCellIndexForIcon:icon gridCellInfoOptions:0];
