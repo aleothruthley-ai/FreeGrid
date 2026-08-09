@@ -32,6 +32,11 @@ struct SBHIconGridRange {
 @interface SBIconListView : UIView
 - (NSString *)iconLocation;
 - (BOOL)allowsGaps;
+- (id)model;
+- (void)regenerateTemporaryDisplayedModelIfNecessary;
+- (void)layoutIconsIfNeeded;
+- (void)layoutIconsIfNeeded:(double)arg1;
+- (void)layoutIconsIfNeeded:(double)arg1 animationType:(long long)arg2 options:(unsigned long long)arg3;
 @end
 
 @interface SBIconListModel : NSObject
@@ -177,7 +182,7 @@ static BOOL IsDockList(SBIconListModel *model) {
     return NO;
 }
 
-// 只把已经记录的用户移动图标重新写回 Fixed，绝不碰没动过的图标
+// 只把已经记录的用户移动图标重新写回 Fixed
 static void ApplyUserMovedLocations(SBIconListModel *model) {
     if (!model || IsDockList(model)) return;
     NSString *listID = [model uniqueIdentifier];
@@ -227,7 +232,6 @@ static void CleanupIconFromPlist(SBIconListModel *model, id icon) {
     }
 }
 
-// 用户真正拖动落地时才记录
 static void RecordUserMovedIcon(SBIconListModel *model, id icon, unsigned long long index) {
     if (!model || !icon || index == NSNotFound || index >= [model maxNumberOfIcons] || IsDockList(model)) return;
 
@@ -249,7 +253,7 @@ static void RecordUserMovedIcon(SBIconListModel *model, id icon, unsigned long l
 }
 
 // ===================================================================
-// 视图层
+// 视图层（关键：拦截临时模型重建）
 // ===================================================================
 %hook SBIconListView
 
@@ -261,6 +265,51 @@ static void RecordUserMovedIcon(SBIconListModel *model, id icon, unsigned long l
         }
     }
     return YES;
+}
+
+// 系统开始拖动时会重建临时模型，这里立刻把用户位置写回去
+- (void)regenerateTemporaryDisplayedModelIfNecessary {
+    %orig;
+    id model = nil;
+    if ([self respondsToSelector:@selector(model)]) {
+        model = [self model];
+    }
+    if (model) {
+        ApplyUserMovedLocations(model);
+    }
+}
+
+- (void)layoutIconsIfNeeded {
+    %orig;
+    id model = nil;
+    if ([self respondsToSelector:@selector(model)]) {
+        model = [self model];
+    }
+    if (model) {
+        ApplyUserMovedLocations(model);
+    }
+}
+
+- (void)layoutIconsIfNeeded:(double)arg1 {
+    %orig;
+    id model = nil;
+    if ([self respondsToSelector:@selector(model)]) {
+        model = [self model];
+    }
+    if (model) {
+        ApplyUserMovedLocations(model);
+    }
+}
+
+- (void)layoutIconsIfNeeded:(double)arg1 animationType:(long long)arg2 options:(unsigned long long)arg3 {
+    %orig;
+    id model = nil;
+    if ([self respondsToSelector:@selector(model)]) {
+        model = [self model];
+    }
+    if (model) {
+        ApplyUserMovedLocations(model);
+    }
 }
 
 %end
@@ -304,8 +353,6 @@ static void RecordUserMovedIcon(SBIconListModel *model, id icon, unsigned long l
     return YES;
 }
 
-// 关键：每次被查询时，如果这个图标有记录，就重新强制 setFixedLocation
-// 防止系统在重建临时模型时把位置丢掉
 - (BOOL)isIconFixed:(id)icon {
     if (!icon || IsDockList(self)) return %orig;
 
@@ -345,7 +392,6 @@ static void RecordUserMovedIcon(SBIconListModel *model, id icon, unsigned long l
     if (cfg && cfg[iconID]) {
         unsigned long long loc = [cfg[iconID] unsignedLongLongValue];
         if (loc < [self maxNumberOfIcons]) {
-            // 每次查询都重新强制写一次，保证临时模型不会丢
             if ([self respondsToSelector:@selector(setFixedLocation:forIcon:options:)]) {
                 [self setFixedLocation:loc forIcon:icon options:0];
             } else {
