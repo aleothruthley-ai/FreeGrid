@@ -97,6 +97,7 @@ struct SBHIconGridRange {
 
 static NSMutableDictionary *gGridConfig = nil;
 static dispatch_queue_t gSaveQueue;
+static BOOL gIsDisplacing = NO;
 
 static void EnsureSaveQueue(void) {
     static dispatch_once_t onceToken;
@@ -177,6 +178,38 @@ static BOOL IsDockList(SBIconListModel *model) {
     return NO;
 }
 
+static unsigned long long FindFirstFreeGridIndex(SBIconListModel *model, unsigned long long preferAvoid) {
+    if (!model) return NSNotFound;
+    unsigned long long max = [model maxNumberOfIcons];
+    if (max == 0) return NSNotFound;
+
+    NSArray *icons = [model icons];
+    if (!icons) return NSNotFound;
+
+    NSMutableSet *occupied = [NSMutableSet new];
+    for (id icon in icons) {
+        if (!icon) continue;
+        unsigned long long loc = NSNotFound;
+        if ([model respondsToSelector:@selector(gridCellIndexForIcon:gridCellInfoOptions:)]) {
+            loc = [model gridCellIndexForIcon:icon gridCellInfoOptions:0];
+        }
+        if (loc == NSNotFound || loc >= max) {
+            loc = [model indexForIcon:icon];
+        }
+        if (loc != NSNotFound && loc < max) {
+            [occupied addObject:@(loc)];
+        }
+    }
+
+    for (unsigned long long i = 0; i < max; i++) {
+        if (i == preferAvoid) continue;
+        if (![occupied containsObject:@(i)]) {
+            return i;
+        }
+    }
+    return NSNotFound;
+}
+
 static void ApplyUserMovedLocations(SBIconListModel *model) {
     if (!model || IsDockList(model)) return;
     NSString *listID = [model uniqueIdentifier];
@@ -226,7 +259,6 @@ static void CleanupIconFromPlist(SBIconListModel *model, id icon) {
     }
 }
 
-// 按你说的方法：更新目标图标后，立刻把页面上所有其它已记录图标强制拉回记录位置
 static void ForceSaveFixedLocation(SBIconListModel *model, id icon, unsigned long long index) {
     if (!model || !icon || index == NSNotFound || index >= [model maxNumberOfIcons] || IsDockList(model)) return;
 
@@ -234,7 +266,6 @@ static void ForceSaveFixedLocation(SBIconListModel *model, id icon, unsigned lon
     NSString *iconID = GetIconID(icon);
     if (!listID || !iconID) return;
 
-    // 1. 先把当前移动的图标位置写进去
     if ([model respondsToSelector:@selector(setFixedLocation:forIcon:options:)]) {
         [model setFixedLocation:index forIcon:icon options:0];
     } else {
@@ -247,8 +278,56 @@ static void ForceSaveFixedLocation(SBIconListModel *model, id icon, unsigned lon
     gGridConfig[listID] = listConfig;
     SaveGridConfig();
 
-    // 2. 立刻把页面上所有其它已记录的图标强制拉回我们记录的位置
+    // 立刻把其它已记录图标拉回位置，防止弹乱
     ApplyUserMovedLocations(model);
+}
+
+// 安全让位：只在用户拖到格子时执行，防重入
+static void DisplaceOccupiedIfNeeded(SBIconListModel *model, unsigned long long targetIndex, unsigned long long options, unsigned long long mutationOptions) {
+    if (gIsDisplacing) return;
+    if (!model || targetIndex == NSNotFound) return;
+
+    NSArray *icons = [model icons];
+    if (!icons || icons.count == 0) return;
+
+    unsigned long long max = [model maxNumberOfIcons];
+    if (targetIndex >= max) return;
+
+    id existing = nil;
+
+    // 用 gridCellIndex 找占用者（支持空隙）
+    if ([model respondsToSelector:@selector(gridCellIndexForIcon:gridCellInfoOptions:)]) {
+        for (id ic in icons) {
+            if (!ic) continue;
+            unsigned long long loc = [model gridCellIndexForIcon:ic gridCellInfoOptions:0];
+            if (loc == targetIndex) {
+                existing = ic;
+                break;
+            }
+        }
+    }
+
+    if (!existing && targetIndex < icons.count) {
+        existing = icons[targetIndex];
+    }
+
+    if (!existing) return;
+
+    unsigned long long freeIdx = FindFirstFreeGridIndex(model, targetIndex);
+    if (freeIdx == NSNotFound || freeIdx == targetIndex) return;
+
+    gIsDisplacing = YES;
+
+    if ([model respondsToSelector:@selector(moveContainedIcon:toGridCellIndex:gridCellInfoOptions:mutationOptions:)]) {
+        [model moveContainedIcon:existing toGridCellIndex:freeIdx gridCellInfoOptions:options mutationOptions:mutationOptions];
+    } else if ([model respondsToSelector:@selector(moveContainedIcon:toIndex:options:)]) {
+        [model moveContainedIcon:existing toIndex:freeIdx options:0];
+    }
+
+    // 把被挪走的图标也记录下来
+    ForceSaveFixedLocation(model, existing, freeIdx);
+
+    gIsDisplacing = NO;
 }
 
 // ===================================================================
@@ -387,20 +466,24 @@ static void ForceSaveFixedLocation(SBIconListModel *model, id icon, unsigned lon
     return %orig;
 }
 
+// 用户拖拽路径 → 先让位，再记录
 - (id)insertIcon:(id)icon atGridCellIndex:(unsigned long long)index gridCellInfoOptions:(unsigned long long)options mutationOptions:(unsigned long long)mutationOptions {
+    DisplaceOccupiedIfNeeded(self, index, options, mutationOptions);
     id result = %orig;
     ForceSaveFixedLocation(self, icon, index);
-    return result;
-}
-
-- (id)insertIcon:(id)icon atIndex:(unsigned long long)index options:(unsigned long long)options {
-    id result = %orig;
     return result;
 }
 
 - (id)moveContainedIcon:(id)icon toGridCellIndex:(unsigned long long)index gridCellInfoOptions:(unsigned long long)options mutationOptions:(unsigned long long)mutationOptions {
+    DisplaceOccupiedIfNeeded(self, index, options, mutationOptions);
     id result = %orig;
     ForceSaveFixedLocation(self, icon, index);
+    return result;
+}
+
+// 系统内部路径不让位、不强制记录
+- (id)insertIcon:(id)icon atIndex:(unsigned long long)index options:(unsigned long long)options {
+    id result = %orig;
     return result;
 }
 
