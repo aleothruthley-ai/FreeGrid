@@ -177,12 +177,6 @@ static BOOL IsDockList(SBIconListModel *model) {
     return NO;
 }
 
-static BOOL IsFolderIcon(id icon) {
-    if (!icon) return NO;
-    Class folderIconClass = NSClassFromString(@"SBFolderIcon");
-    return folderIconClass && [icon isKindOfClass:folderIconClass];
-}
-
 static unsigned long long FindFirstFreeGridIndex(SBIconListModel *model, unsigned long long preferAvoid) {
     if (!model) return NSNotFound;
     unsigned long long max = [model maxNumberOfIcons];
@@ -330,19 +324,18 @@ static void ForceSaveFixedLocation(SBIconListModel *model, id icon, unsigned lon
     ApplyFixedLocationsFromPlist(model);
 }
 
-// 关键：对任意占用者（普通图标 + 文件夹）都主动让位
+// 对任意占用者（普通图标 + 文件夹）都主动让位
 static void DisplaceOccupiedIfNeeded(SBIconListModel *model, unsigned long long targetIndex, unsigned long long options, unsigned long long mutationOptions) {
     if (!model || targetIndex == NSNotFound) return;
 
     NSArray *icons = [model icons];
-    if (!icons || icons.count == 0) return;          // 反序列化早期直接跳过，避免崩溃
+    if (!icons || icons.count == 0) return;
 
     unsigned long long max = [model maxNumberOfIcons];
     if (targetIndex >= max) return;
 
     id existing = nil;
 
-    // 优先用 gridCellIndex 精确匹配（支持 gaps）
     if ([model respondsToSelector:@selector(gridCellIndexForIcon:gridCellInfoOptions:)]) {
         for (id ic in icons) {
             if (!ic) continue;
@@ -354,12 +347,11 @@ static void DisplaceOccupiedIfNeeded(SBIconListModel *model, unsigned long long 
         }
     }
 
-    // 兜底：只有当 targetIndex 落在当前 icons 数组范围内才用数组下标
     if (!existing && targetIndex < icons.count) {
         existing = icons[targetIndex];
     }
 
-    if (!existing) return;   // 空位，不需要让
+    if (!existing) return;
 
     unsigned long long freeIdx = FindFirstFreeGridIndex(model, targetIndex);
     if (freeIdx == NSNotFound || freeIdx == targetIndex) return;
@@ -430,7 +422,6 @@ static void DisplaceOccupiedIfNeeded(SBIconListModel *model, unsigned long long 
 
 - (BOOL)isIconFixed:(id)icon {
     if (!icon || IsDockList(self)) return %orig;
-    // 全部强制 Fixed，由我们主动 Displace 来实现让位
     return YES;
 }
 
