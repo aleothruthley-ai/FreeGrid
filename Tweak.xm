@@ -131,7 +131,6 @@ static void SaveGridConfig(void) {
     });
 }
 
-// 强化文件夹 ID（桌面文件夹图标需要记录，文件夹内部不处理）
 static NSString *GetIconID(id icon) {
     if (!icon) return nil;
 
@@ -171,11 +170,8 @@ static NSString *GetIconID(id icon) {
     return [NSString stringWithFormat:@"%p", icon];
 }
 
-// 只处理桌面根页面，文件夹内部完全不管
 static BOOL ShouldManageList(SBIconListModel *model) {
-    if (!model) return NO;
-    // 简单排除 Dock（如需更精确可后续加 iconLocation 判断）
-    return YES;
+    return model != nil;
 }
 
 static void SnapshotCurrentLayoutIfNeeded(SBIconListModel *model) {
@@ -290,7 +286,6 @@ static void ForceSaveFixedLocation(SBIconListModel *model, id icon, unsigned lon
     gGridConfig[listID] = listConfig;
     SaveGridConfig();
 
-    // 立刻全量拉回，防止其它图标乱动
     ApplyFixedLocationsFromPlist(model);
 }
 
@@ -305,7 +300,7 @@ static void ForceSaveFixedLocation(SBIconListModel *model, id icon, unsigned lon
         if (location && ([location containsString:@"Dock"] || [location containsString:@"dock"])) {
             return %orig;
         }
-        // 文件夹内部不需要随意摆放
+        // 文件夹内部不启用自由摆放
         if (location && ([location containsString:@"Folder"] || [location containsString:@"folder"])) {
             return %orig;
         }
@@ -415,45 +410,23 @@ static void ForceSaveFixedLocation(SBIconListModel *model, id icon, unsigned lon
 }
 - (BOOL)canUseFastGridLayoutValidity { return NO; }
 
-// ========== 关键改动：恢复让位 ==========
-// 目标格子是空的 → 强制用你的 index（随意摆放）
-// 目标格子已有图标 → 走系统原逻辑（主动让位）
+// 安全版本：不再调用 iconAtIndex:，避免临时模型崩溃
 - (unsigned long long)bestGridCellIndexForInsertingIcon:(id)icon atGridCellIndex:(unsigned long long)index {
-    if (index == NSNotFound || index >= [self maxNumberOfIcons]) return %orig;
-
-    id existing = nil;
-    if ([self respondsToSelector:@selector(iconAtIndex:)]) {
-        existing = [self iconAtIndex:index];
-    }
-    if (!existing) {
-        // 空位，强制自由放置
+    if (index != NSNotFound && index < [self maxNumberOfIcons]) {
         return index;
     }
-    // 有图标，让系统计算让位
     return %orig;
 }
 
 - (unsigned long long)bestGridCellIndexForInsertingIcon:(id)icon atGridCellIndex:(unsigned long long)index gridCellInfoOptions:(unsigned long long)options {
-    if (index == NSNotFound || index >= [self maxNumberOfIcons]) return %orig;
-
-    id existing = nil;
-    if ([self respondsToSelector:@selector(iconAtIndex:)]) {
-        existing = [self iconAtIndex:index];
-    }
-    if (!existing) {
+    if (index != NSNotFound && index < [self maxNumberOfIcons]) {
         return index;
     }
     return %orig;
 }
 
 - (unsigned long long)bestGridCellIndexForInsertingIcon:(id)icon atGridCellIndex:(unsigned long long)index gridCellInfo:(id)info {
-    if (index == NSNotFound || index >= [self maxNumberOfIcons]) return %orig;
-
-    id existing = nil;
-    if ([self respondsToSelector:@selector(iconAtIndex:)]) {
-        existing = [self iconAtIndex:index];
-    }
-    if (!existing) {
+    if (index != NSNotFound && index < [self maxNumberOfIcons]) {
         return index;
     }
     return %orig;
