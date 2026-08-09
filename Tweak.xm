@@ -330,12 +330,12 @@ static void ForceSaveFixedLocation(SBIconListModel *model, id icon, unsigned lon
     ApplyFixedLocationsFromPlist(model);
 }
 
-// 安全版本：绝不调用会断言的 iconAtIndex: / _iconAtIndex:
-static void DisplaceFolderIfNeeded(SBIconListModel *model, unsigned long long targetIndex, unsigned long long options, unsigned long long mutationOptions) {
+// 关键：对任意占用者（普通图标 + 文件夹）都主动让位
+static void DisplaceOccupiedIfNeeded(SBIconListModel *model, unsigned long long targetIndex, unsigned long long options, unsigned long long mutationOptions) {
     if (!model || targetIndex == NSNotFound) return;
 
     NSArray *icons = [model icons];
-    if (!icons || icons.count == 0) return;   // 反序列化早期直接跳过
+    if (!icons || icons.count == 0) return;          // 反序列化早期直接跳过，避免崩溃
 
     unsigned long long max = [model maxNumberOfIcons];
     if (targetIndex >= max) return;
@@ -359,7 +359,7 @@ static void DisplaceFolderIfNeeded(SBIconListModel *model, unsigned long long ta
         existing = icons[targetIndex];
     }
 
-    if (!existing || !IsFolderIcon(existing)) return;
+    if (!existing) return;   // 空位，不需要让
 
     unsigned long long freeIdx = FindFirstFreeGridIndex(model, targetIndex);
     if (freeIdx == NSNotFound || freeIdx == targetIndex) return;
@@ -430,9 +430,7 @@ static void DisplaceFolderIfNeeded(SBIconListModel *model, unsigned long long ta
 
 - (BOOL)isIconFixed:(id)icon {
     if (!icon || IsDockList(self)) return %orig;
-    if (IsFolderIcon(icon)) {
-        return %orig;
-    }
+    // 全部强制 Fixed，由我们主动 Displace 来实现让位
     return YES;
 }
 
@@ -506,15 +504,14 @@ static void DisplaceFolderIfNeeded(SBIconListModel *model, unsigned long long ta
 }
 
 - (id)insertIcon:(id)icon atGridCellIndex:(unsigned long long)index gridCellInfoOptions:(unsigned long long)options mutationOptions:(unsigned long long)mutationOptions {
-    DisplaceFolderIfNeeded(self, index, options, mutationOptions);
+    DisplaceOccupiedIfNeeded(self, index, options, mutationOptions);
     id result = %orig;
     ForceSaveFixedLocation(self, icon, index);
     return result;
 }
 
 - (id)insertIcon:(id)icon atIndex:(unsigned long long)index options:(unsigned long long)options {
-    // 反序列化阶段 index 是数组下标，也做一次安全检查
-    DisplaceFolderIfNeeded(self, index, 0, 0);
+    DisplaceOccupiedIfNeeded(self, index, 0, 0);
     id result = %orig;
     unsigned long long gridIdx = [self fixedLocationForIcon:icon];
     if (gridIdx != NSNotFound) {
@@ -524,14 +521,14 @@ static void DisplaceFolderIfNeeded(SBIconListModel *model, unsigned long long ta
 }
 
 - (id)moveContainedIcon:(id)icon toGridCellIndex:(unsigned long long)index gridCellInfoOptions:(unsigned long long)options mutationOptions:(unsigned long long)mutationOptions {
-    DisplaceFolderIfNeeded(self, index, options, mutationOptions);
+    DisplaceOccupiedIfNeeded(self, index, options, mutationOptions);
     id result = %orig;
     ForceSaveFixedLocation(self, icon, index);
     return result;
 }
 
 - (void)moveContainedIcon:(id)icon toIndex:(unsigned long long)index options:(unsigned long long)options {
-    DisplaceFolderIfNeeded(self, index, 0, 0);
+    DisplaceOccupiedIfNeeded(self, index, 0, 0);
     %orig;
     unsigned long long gridIdx = [self fixedLocationForIcon:icon];
     if (gridIdx != NSNotFound) {
@@ -552,7 +549,6 @@ static void DisplaceFolderIfNeeded(SBIconListModel *model, unsigned long long ta
     CleanupIconFromPlist(self, icon);
 }
 - (void)removeIconAtIndex:(unsigned long long)index {
-    // 安全获取 icon，避免断言
     id icon = nil;
     NSArray *icons = [self icons];
     if (icons && index < icons.count) {
