@@ -186,9 +186,14 @@ static BOOL IsFolderIcon(id icon) {
 static unsigned long long FindFirstFreeGridIndex(SBIconListModel *model, unsigned long long preferAvoid) {
     if (!model) return NSNotFound;
     unsigned long long max = [model maxNumberOfIcons];
+    if (max == 0) return NSNotFound;
+
     NSArray *icons = [model icons];
+    if (!icons) return NSNotFound;
+
     NSMutableSet *occupied = [NSMutableSet new];
     for (id icon in icons) {
+        if (!icon) continue;
         unsigned long long loc = NSNotFound;
         if ([model respondsToSelector:@selector(gridCellIndexForIcon:gridCellInfoOptions:)]) {
             loc = [model gridCellIndexForIcon:icon gridCellInfoOptions:0];
@@ -200,6 +205,7 @@ static unsigned long long FindFirstFreeGridIndex(SBIconListModel *model, unsigne
             [occupied addObject:@(loc)];
         }
     }
+
     for (unsigned long long i = 0; i < max; i++) {
         if (i == preferAvoid) continue;
         if (![occupied containsObject:@(i)]) {
@@ -324,24 +330,35 @@ static void ForceSaveFixedLocation(SBIconListModel *model, id icon, unsigned lon
     ApplyFixedLocationsFromPlist(model);
 }
 
+// 安全版本：绝不调用会断言的 iconAtIndex: / _iconAtIndex:
 static void DisplaceFolderIfNeeded(SBIconListModel *model, unsigned long long targetIndex, unsigned long long options, unsigned long long mutationOptions) {
     if (!model || targetIndex == NSNotFound) return;
+
+    NSArray *icons = [model icons];
+    if (!icons || icons.count == 0) return;   // 反序列化早期直接跳过
+
+    unsigned long long max = [model maxNumberOfIcons];
+    if (targetIndex >= max) return;
+
     id existing = nil;
-    if (targetIndex < [model maxNumberOfIcons]) {
-        existing = [model iconAtIndex:targetIndex];
-    }
-    if (!existing) {
-        if ([model respondsToSelector:@selector(gridCellIndexForIcon:gridCellInfoOptions:)]) {
-            NSArray *icons = [model icons];
-            for (id ic in icons) {
-                unsigned long long loc = [model gridCellIndexForIcon:ic gridCellInfoOptions:0];
-                if (loc == targetIndex) {
-                    existing = ic;
-                    break;
-                }
+
+    // 优先用 gridCellIndex 精确匹配（支持 gaps）
+    if ([model respondsToSelector:@selector(gridCellIndexForIcon:gridCellInfoOptions:)]) {
+        for (id ic in icons) {
+            if (!ic) continue;
+            unsigned long long loc = [model gridCellIndexForIcon:ic gridCellInfoOptions:0];
+            if (loc == targetIndex) {
+                existing = ic;
+                break;
             }
         }
     }
+
+    // 兜底：只有当 targetIndex 落在当前 icons 数组范围内才用数组下标
+    if (!existing && targetIndex < icons.count) {
+        existing = icons[targetIndex];
+    }
+
     if (!existing || !IsFolderIcon(existing)) return;
 
     unsigned long long freeIdx = FindFirstFreeGridIndex(model, targetIndex);
@@ -349,7 +366,7 @@ static void DisplaceFolderIfNeeded(SBIconListModel *model, unsigned long long ta
 
     if ([model respondsToSelector:@selector(moveContainedIcon:toGridCellIndex:gridCellInfoOptions:mutationOptions:)]) {
         [model moveContainedIcon:existing toGridCellIndex:freeIdx gridCellInfoOptions:options mutationOptions:mutationOptions];
-    } else {
+    } else if ([model respondsToSelector:@selector(moveContainedIcon:toIndex:options:)]) {
         [model moveContainedIcon:existing toIndex:freeIdx options:0];
     }
     ForceSaveFixedLocation(model, existing, freeIdx);
@@ -496,6 +513,7 @@ static void DisplaceFolderIfNeeded(SBIconListModel *model, unsigned long long ta
 }
 
 - (id)insertIcon:(id)icon atIndex:(unsigned long long)index options:(unsigned long long)options {
+    // 反序列化阶段 index 是数组下标，也做一次安全检查
     DisplaceFolderIfNeeded(self, index, 0, 0);
     id result = %orig;
     unsigned long long gridIdx = [self fixedLocationForIcon:icon];
@@ -534,12 +552,21 @@ static void DisplaceFolderIfNeeded(SBIconListModel *model, unsigned long long ta
     CleanupIconFromPlist(self, icon);
 }
 - (void)removeIconAtIndex:(unsigned long long)index {
-    id icon = (index < [self maxNumberOfIcons]) ? [self iconAtIndex:index] : nil;
+    // 安全获取 icon，避免断言
+    id icon = nil;
+    NSArray *icons = [self icons];
+    if (icons && index < icons.count) {
+        icon = icons[index];
+    }
     %orig;
     if (icon) CleanupIconFromPlist(self, icon);
 }
 - (void)removeIconAtIndex:(unsigned long long)index options:(unsigned long long)options {
-    id icon = (index < [self maxNumberOfIcons]) ? [self iconAtIndex:index] : nil;
+    id icon = nil;
+    NSArray *icons = [self icons];
+    if (icons && index < icons.count) {
+        icon = icons[index];
+    }
     %orig;
     if (icon) CleanupIconFromPlist(self, icon);
 }
