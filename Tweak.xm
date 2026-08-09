@@ -32,7 +32,6 @@ struct SBHIconGridRange {
 @interface SBIconListView : UIView
 - (NSString *)iconLocation;
 - (BOOL)allowsGaps;
-- (id)model;
 @end
 
 @interface SBIconListModel : NSObject
@@ -227,13 +226,15 @@ static void CleanupIconFromPlist(SBIconListModel *model, id icon) {
     }
 }
 
-static void RecordUserMovedIcon(SBIconListModel *model, id icon, unsigned long long index) {
+// 按你说的方法：更新目标图标后，立刻把页面上所有其它已记录图标强制拉回记录位置
+static void ForceSaveFixedLocation(SBIconListModel *model, id icon, unsigned long long index) {
     if (!model || !icon || index == NSNotFound || index >= [model maxNumberOfIcons] || IsDockList(model)) return;
 
     NSString *listID = [model uniqueIdentifier];
     NSString *iconID = GetIconID(icon);
     if (!listID || !iconID) return;
 
+    // 1. 先把当前移动的图标位置写进去
     if ([model respondsToSelector:@selector(setFixedLocation:forIcon:options:)]) {
         [model setFixedLocation:index forIcon:icon options:0];
     } else {
@@ -245,6 +246,9 @@ static void RecordUserMovedIcon(SBIconListModel *model, id icon, unsigned long l
     listConfig[iconID] = @(index);
     gGridConfig[listID] = listConfig;
     SaveGridConfig();
+
+    // 2. 立刻把页面上所有其它已记录的图标强制拉回我们记录的位置
+    ApplyUserMovedLocations(model);
 }
 
 // ===================================================================
@@ -385,7 +389,7 @@ static void RecordUserMovedIcon(SBIconListModel *model, id icon, unsigned long l
 
 - (id)insertIcon:(id)icon atGridCellIndex:(unsigned long long)index gridCellInfoOptions:(unsigned long long)options mutationOptions:(unsigned long long)mutationOptions {
     id result = %orig;
-    RecordUserMovedIcon(self, icon, index);
+    ForceSaveFixedLocation(self, icon, index);
     return result;
 }
 
@@ -396,7 +400,7 @@ static void RecordUserMovedIcon(SBIconListModel *model, id icon, unsigned long l
 
 - (id)moveContainedIcon:(id)icon toGridCellIndex:(unsigned long long)index gridCellInfoOptions:(unsigned long long)options mutationOptions:(unsigned long long)mutationOptions {
     id result = %orig;
-    RecordUserMovedIcon(self, icon, index);
+    ForceSaveFixedLocation(self, icon, index);
     return result;
 }
 
