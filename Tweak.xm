@@ -22,6 +22,11 @@ struct SBHIconGridRange {
 - (NSString *)leafIdentifier;
 - (NSString *)applicationBundleIdentifier;
 - (NSString *)nodeIdentifier;
+- (id)folder;
+@end
+
+@interface SBFolder : NSObject
+- (NSString *)uniqueIdentifier;
 @end
 
 @interface SBIconListView : UIView
@@ -126,6 +131,33 @@ static void SaveGridConfig(void) {
 
 static NSString *GetIconID(id icon) {
     if (!icon) return nil;
+
+    Class folderIconClass = NSClassFromString(@"SBFolderIcon");
+    if (folderIconClass && [icon isKindOfClass:folderIconClass]) {
+        if ([icon respondsToSelector:@selector(folder)]) {
+            id folder = [icon folder];
+            if (folder && [folder respondsToSelector:@selector(uniqueIdentifier)]) {
+                NSString *fid = [folder uniqueIdentifier];
+                if (fid.length > 0) {
+                    return [@"folder:" stringByAppendingString:fid];
+                }
+            }
+        }
+        if ([icon respondsToSelector:@selector(nodeIdentifier)]) {
+            NSString *node = [icon nodeIdentifier];
+            if (node.length > 0) {
+                return [@"folder-node:" stringByAppendingString:node];
+            }
+        }
+        if ([icon respondsToSelector:@selector(leafIdentifier)]) {
+            NSString *leaf = [icon leafIdentifier];
+            if (leaf.length > 0) {
+                return [@"folder-leaf:" stringByAppendingString:leaf];
+            }
+        }
+        return [NSString stringWithFormat:@"folder-%p", icon];
+    }
+
     if ([icon respondsToSelector:@selector(leafIdentifier)]) {
         NSString *leaf = [icon leafIdentifier];
         if (leaf.length > 0) return leaf;
@@ -145,7 +177,38 @@ static BOOL IsDockList(SBIconListModel *model) {
     return NO;
 }
 
-// 首次安装完整快照
+static BOOL IsFolderIcon(id icon) {
+    if (!icon) return NO;
+    Class folderIconClass = NSClassFromString(@"SBFolderIcon");
+    return folderIconClass && [icon isKindOfClass:folderIconClass];
+}
+
+static unsigned long long FindFirstFreeGridIndex(SBIconListModel *model, unsigned long long preferAvoid) {
+    if (!model) return NSNotFound;
+    unsigned long long max = [model maxNumberOfIcons];
+    NSArray *icons = [model icons];
+    NSMutableSet *occupied = [NSMutableSet new];
+    for (id icon in icons) {
+        unsigned long long loc = NSNotFound;
+        if ([model respondsToSelector:@selector(gridCellIndexForIcon:gridCellInfoOptions:)]) {
+            loc = [model gridCellIndexForIcon:icon gridCellInfoOptions:0];
+        }
+        if (loc == NSNotFound || loc >= max) {
+            loc = [model indexForIcon:icon];
+        }
+        if (loc != NSNotFound && loc < max) {
+            [occupied addObject:@(loc)];
+        }
+    }
+    for (unsigned long long i = 0; i < max; i++) {
+        if (i == preferAvoid) continue;
+        if (![occupied containsObject:@(i)]) {
+            return i;
+        }
+    }
+    return NSNotFound;
+}
+
 static void SnapshotCurrentLayoutIfNeeded(SBIconListModel *model) {
     if (!model || IsDockList(model)) return;
     NSString *listID = [model uniqueIdentifier];
@@ -187,7 +250,6 @@ static void SnapshotCurrentLayoutIfNeeded(SBIconListModel *model) {
     }
 }
 
-// 全量强制应用我们记录的位置（防止其它图标乱跑的关键）
 static void ApplyFixedLocationsFromPlist(SBIconListModel *model) {
     if (!model || IsDockList(model)) return;
     NSString *listID = [model uniqueIdentifier];
@@ -240,7 +302,6 @@ static void CleanupIconFromPlist(SBIconListModel *model, id icon) {
     }
 }
 
-// 只更新单个图标位置，然后立刻全量拉回其它图标
 static void ForceSaveFixedLocation(SBIconListModel *model, id icon, unsigned long long index) {
     if (!model || !icon || index == NSNotFound || index >= [model maxNumberOfIcons] || IsDockList(model)) return;
 
@@ -248,7 +309,6 @@ static void ForceSaveFixedLocation(SBIconListModel *model, id icon, unsigned lon
     NSString *iconID = GetIconID(icon);
     if (!listID || !iconID) return;
 
-    // 先写入目标图标
     if ([model respondsToSelector:@selector(setFixedLocation:forIcon:options:)]) {
         [model setFixedLocation:index forIcon:icon options:0];
     } else {
@@ -261,8 +321,38 @@ static void ForceSaveFixedLocation(SBIconListModel *model, id icon, unsigned lon
     gGridConfig[listID] = listConfig;
     SaveGridConfig();
 
-    // 关键：立刻把所有其它图标强制拉回我们记录的位置，阻止乱动
     ApplyFixedLocationsFromPlist(model);
+}
+
+static void DisplaceFolderIfNeeded(SBIconListModel *model, unsigned long long targetIndex, unsigned long long options, unsigned long long mutationOptions) {
+    if (!model || targetIndex == NSNotFound) return;
+    id existing = nil;
+    if (targetIndex < [model maxNumberOfIcons]) {
+        existing = [model iconAtIndex:targetIndex];
+    }
+    if (!existing) {
+        if ([model respondsToSelector:@selector(gridCellIndexForIcon:gridCellInfoOptions:)]) {
+            NSArray *icons = [model icons];
+            for (id ic in icons) {
+                unsigned long long loc = [model gridCellIndexForIcon:ic gridCellInfoOptions:0];
+                if (loc == targetIndex) {
+                    existing = ic;
+                    break;
+                }
+            }
+        }
+    }
+    if (!existing || !IsFolderIcon(existing)) return;
+
+    unsigned long long freeIdx = FindFirstFreeGridIndex(model, targetIndex);
+    if (freeIdx == NSNotFound || freeIdx == targetIndex) return;
+
+    if ([model respondsToSelector:@selector(moveContainedIcon:toGridCellIndex:gridCellInfoOptions:mutationOptions:)]) {
+        [model moveContainedIcon:existing toGridCellIndex:freeIdx gridCellInfoOptions:options mutationOptions:mutationOptions];
+    } else {
+        [model moveContainedIcon:existing toIndex:freeIdx options:0];
+    }
+    ForceSaveFixedLocation(model, existing, freeIdx);
 }
 
 // ===================================================================
@@ -300,7 +390,6 @@ static void ForceSaveFixedLocation(SBIconListModel *model, id icon, unsigned lon
 }
 
 - (void)ensureFixedIconLocationsIfNecessary {
-    // 空实现
 }
 
 %end
@@ -322,9 +411,11 @@ static void ForceSaveFixedLocation(SBIconListModel *model, id icon, unsigned lon
     return YES;
 }
 
-// 强制所有非 Dock 图标都是 Fixed
 - (BOOL)isIconFixed:(id)icon {
     if (!icon || IsDockList(self)) return %orig;
+    if (IsFolderIcon(icon)) {
+        return %orig;
+    }
     return YES;
 }
 
@@ -351,7 +442,6 @@ static void ForceSaveFixedLocation(SBIconListModel *model, id icon, unsigned lon
         }
     }
 
-    // 没有记录时记录当前位置
     unsigned long long loc = NSNotFound;
     if ([self respondsToSelector:@selector(gridCellIndexForIcon:gridCellInfoOptions:)]) {
         loc = [self gridCellIndexForIcon:icon gridCellInfoOptions:0];
@@ -399,12 +489,14 @@ static void ForceSaveFixedLocation(SBIconListModel *model, id icon, unsigned lon
 }
 
 - (id)insertIcon:(id)icon atGridCellIndex:(unsigned long long)index gridCellInfoOptions:(unsigned long long)options mutationOptions:(unsigned long long)mutationOptions {
+    DisplaceFolderIfNeeded(self, index, options, mutationOptions);
     id result = %orig;
     ForceSaveFixedLocation(self, icon, index);
     return result;
 }
 
 - (id)insertIcon:(id)icon atIndex:(unsigned long long)index options:(unsigned long long)options {
+    DisplaceFolderIfNeeded(self, index, 0, 0);
     id result = %orig;
     unsigned long long gridIdx = [self fixedLocationForIcon:icon];
     if (gridIdx != NSNotFound) {
@@ -414,12 +506,14 @@ static void ForceSaveFixedLocation(SBIconListModel *model, id icon, unsigned lon
 }
 
 - (id)moveContainedIcon:(id)icon toGridCellIndex:(unsigned long long)index gridCellInfoOptions:(unsigned long long)options mutationOptions:(unsigned long long)mutationOptions {
+    DisplaceFolderIfNeeded(self, index, options, mutationOptions);
     id result = %orig;
     ForceSaveFixedLocation(self, icon, index);
     return result;
 }
 
 - (void)moveContainedIcon:(id)icon toIndex:(unsigned long long)index options:(unsigned long long)options {
+    DisplaceFolderIfNeeded(self, index, 0, 0);
     %orig;
     unsigned long long gridIdx = [self fixedLocationForIcon:icon];
     if (gridIdx != NSNotFound) {
