@@ -184,7 +184,6 @@ static void SnapshotCurrentLayoutIfNeeded(SBIconListModel *model) {
     if (listConfig.count) {
         gGridConfig[listID] = listConfig;
         SaveGridConfig();
-        // 强制系统把当前布局标记为 Fixed
         if ([model respondsToSelector:@selector(saveCurrentIconLocationsAsFixed)]) {
             [model saveCurrentIconLocationsAsFixed];
         }
@@ -265,7 +264,6 @@ static void ForceSaveFixedLocation(SBIconListModel *model, id icon, unsigned lon
     gGridConfig[listID] = listConfig;
     SaveGridConfig();
 
-    // 关键：通知系统把当前位置全部标记为 Fixed
     if ([model respondsToSelector:@selector(saveCurrentIconLocationsAsFixed)]) {
         [model saveCurrentIconLocationsAsFixed];
     } else if ([model respondsToSelector:@selector(saveOnlyRequiredIconLocationsAsFixed)]) {
@@ -330,9 +328,17 @@ static void ForceSaveFixedLocation(SBIconListModel *model, id icon, unsigned lon
     return YES;
 }
 
+// 关键修复：只把有记录的图标标记为 Fixed，避免满页时互相挤压
 - (BOOL)isIconFixed:(id)icon {
     if (!icon || IsDockList(self)) return %orig;
-    return YES;
+
+    NSString *listID = [self uniqueIdentifier];
+    NSString *iconID = GetIconID(icon);
+    if (!listID || !iconID) return %orig;
+
+    LoadGridConfig();
+    NSDictionary *cfg = gGridConfig[listID];
+    return (cfg && cfg[iconID] != nil);
 }
 
 - (BOOL)isIconFixed:(id)icon gridCellInfoOptions:(unsigned long long)options {
