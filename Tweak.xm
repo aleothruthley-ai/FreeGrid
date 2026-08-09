@@ -180,7 +180,7 @@ static void SnapshotCurrentLayoutIfNeeded(SBIconListModel *model) {
     if (!listID.length) return;
 
     LoadGridConfig();
-    if (gGridConfig[listID]) return;   // 已有记录绝不覆盖
+    if (gGridConfig[listID]) return;
 
     NSArray *icons = [model icons];
     if (!icons.count) return;
@@ -300,7 +300,6 @@ static void ForceSaveFixedLocation(SBIconListModel *model, id icon, unsigned lon
         if (location && ([location containsString:@"Dock"] || [location containsString:@"dock"])) {
             return %orig;
         }
-        // 文件夹内部不启用自由摆放
         if (location && ([location containsString:@"Folder"] || [location containsString:@"folder"])) {
             return %orig;
         }
@@ -410,23 +409,38 @@ static void ForceSaveFixedLocation(SBIconListModel *model, id icon, unsigned lon
 }
 - (BOOL)canUseFastGridLayoutValidity { return NO; }
 
-// 安全版本：不再调用 iconAtIndex:，避免临时模型崩溃
-- (unsigned long long)bestGridCellIndexForInsertingIcon:(id)icon atGridCellIndex:(unsigned long long)index {
-    if (index != NSNotFound && index < [self maxNumberOfIcons]) {
-        return index;
+// ========== 安全判断是否空位（带保护，不会崩溃）==========
+static BOOL IsGridCellEmpty(SBIconListModel *self, unsigned long long index) {
+    if (index == NSNotFound || index >= [self maxNumberOfIcons]) return NO;
+
+    id existing = nil;
+    @try {
+        if ([self respondsToSelector:@selector(iconAtIndex:)]) {
+            existing = [self iconAtIndex:index];
+        }
+    } @catch (__unused NSException *e) {
+        // 临时模型期间可能断言，直接当作有图标，走系统逻辑
+        return NO;
     }
-    return %orig;
+    return (existing == nil);
+}
+
+- (unsigned long long)bestGridCellIndexForInsertingIcon:(id)icon atGridCellIndex:(unsigned long long)index {
+    if (IsGridCellEmpty(self, index)) {
+        return index;   // 空位 → 强制自由放置
+    }
+    return %orig;       // 有图标 → 系统计算让位
 }
 
 - (unsigned long long)bestGridCellIndexForInsertingIcon:(id)icon atGridCellIndex:(unsigned long long)index gridCellInfoOptions:(unsigned long long)options {
-    if (index != NSNotFound && index < [self maxNumberOfIcons]) {
+    if (IsGridCellEmpty(self, index)) {
         return index;
     }
     return %orig;
 }
 
 - (unsigned long long)bestGridCellIndexForInsertingIcon:(id)icon atGridCellIndex:(unsigned long long)index gridCellInfo:(id)info {
-    if (index != NSNotFound && index < [self maxNumberOfIcons]) {
+    if (IsGridCellEmpty(self, index)) {
         return index;
     }
     return %orig;
