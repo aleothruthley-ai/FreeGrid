@@ -3,7 +3,7 @@
 #import <objc/runtime.h>
 
 // ===================================================================
-// 完整结构体定义
+// 结构体定义
 // ===================================================================
 struct SBHIconGridSize {
     unsigned short columns;
@@ -43,6 +43,9 @@ struct SBHIconGridRange {
 - (unsigned long long)fixedLocationForIcon:(id)icon;
 - (void)setFixedLocation:(unsigned long long)location forIcon:(id)icon;
 - (void)setFixedLocation:(unsigned long long)location forIcon:(id)icon options:(unsigned long long)options;
+- (void)saveCurrentIconLocationsAsFixed;
+- (void)saveOnlyRequiredIconLocationsAsFixed;
+- (void)saveOnlyRequiredIconLocationsAsFixedIfRequired;
 - (void)removeAllFixedIconLocations;
 - (void)removeFixedIconLocationForIcon:(id)icon;
 - (void)removeFixedIconLocationsForIcons:(id)icons;
@@ -73,6 +76,13 @@ struct SBHIconGridRange {
 - (void)removeIcon:(id)icon gridCellInfoOptions:(unsigned long long)options mutationOptions:(unsigned long long)mutationOptions;
 - (void)removeIconAtIndex:(unsigned long long)index;
 - (void)removeIconAtIndex:(unsigned long long)index options:(unsigned long long)options;
+@end
+
+@interface SBHIconManager : NSObject
+- (long long)listsFixedIconLocationBehavior;
+- (long long)listsFixedIconLocationBehaviorForFolderClass:(Class)cls;
+- (long long)iconModel:(id)model listsFixedIconLocationBehaviorForFolderClass:(Class)cls;
+- (void)ensureFixedIconLocationsIfNecessary;
 @end
 
 // ===================================================================
@@ -132,17 +142,17 @@ static NSString *GetIconID(id icon) {
 }
 
 static BOOL IsDockList(SBIconListModel *model) {
-    return NO; // Dock 由 View 层保护
+    return NO;
 }
 
-// 首次安装：完整快照当前布局作为基线
+// 首次安装：完整快照当前布局
 static void SnapshotCurrentLayoutIfNeeded(SBIconListModel *model) {
     if (!model || IsDockList(model)) return;
     NSString *listID = [model uniqueIdentifier];
     if (!listID.length) return;
 
     LoadGridConfig();
-    if (gGridConfig[listID]) return; // 已有配置，不重复快照
+    if (gGridConfig[listID]) return;
 
     NSArray *icons = [model icons];
     if (!icons.count) return;
@@ -163,7 +173,6 @@ static void SnapshotCurrentLayoutIfNeeded(SBIconListModel *model) {
         }
         if (loc != NSNotFound && loc < max) {
             listConfig[iconID] = @(loc);
-            // 同步写入系统 Fixed 字典
             if ([model respondsToSelector:@selector(setFixedLocation:forIcon:options:)]) {
                 [model setFixedLocation:loc forIcon:icon options:0];
             } else {
@@ -175,6 +184,10 @@ static void SnapshotCurrentLayoutIfNeeded(SBIconListModel *model) {
     if (listConfig.count) {
         gGridConfig[listID] = listConfig;
         SaveGridConfig();
+        // 强制系统把当前布局标记为 Fixed
+        if ([model respondsToSelector:@selector(saveCurrentIconLocationsAsFixed)]) {
+            [model saveCurrentIconLocationsAsFixed];
+        }
     }
 }
 
@@ -186,7 +199,6 @@ static void ApplyFixedLocationsFromPlist(SBIconListModel *model) {
     LoadGridConfig();
     NSDictionary *listConfig = gGridConfig[listID];
     if (!listConfig.count) {
-        // 没有配置 → 触发首次全量快照
         SnapshotCurrentLayoutIfNeeded(model);
         return;
     }
@@ -195,6 +207,7 @@ static void ApplyFixedLocationsFromPlist(SBIconListModel *model) {
     if (!icons.count) return;
 
     unsigned long long max = [model maxNumberOfIcons];
+    BOOL didSet = NO;
     for (id icon in icons) {
         NSString *iconID = GetIconID(icon);
         if (!iconID) continue;
@@ -207,6 +220,10 @@ static void ApplyFixedLocationsFromPlist(SBIconListModel *model) {
         } else {
             [model setFixedLocation:loc forIcon:icon];
         }
+        didSet = YES;
+    }
+    if (didSet && [model respondsToSelector:@selector(saveCurrentIconLocationsAsFixed)]) {
+        [model saveCurrentIconLocationsAsFixed];
     }
 }
 
@@ -228,6 +245,34 @@ static void CleanupIconFromPlist(SBIconListModel *model, id icon) {
     }
 }
 
+// 强制把当前位置写入系统 Fixed 并持久化
+static void ForceSaveFixedLocation(SBIconListModel *model, id icon, unsigned long long index) {
+    if (!model || !icon || index == NSNotFound || index >= [model maxNumberOfIcons] || IsDockList(model)) return;
+
+    NSString *listID = [model uniqueIdentifier];
+    NSString *iconID = GetIconID(icon);
+    if (!listID || !iconID) return;
+
+    if ([model respondsToSelector:@selector(setFixedLocation:forIcon:options:)]) {
+        [model setFixedLocation:index forIcon:icon options:0];
+    } else {
+        [model setFixedLocation:index forIcon:icon];
+    }
+
+    LoadGridConfig();
+    NSMutableDictionary *listConfig = [gGridConfig[listID] mutableCopy] ?: [NSMutableDictionary new];
+    listConfig[iconID] = @(index);
+    gGridConfig[listID] = listConfig;
+    SaveGridConfig();
+
+    // 关键：通知系统把当前位置全部标记为 Fixed
+    if ([model respondsToSelector:@selector(saveCurrentIconLocationsAsFixed)]) {
+        [model saveCurrentIconLocationsAsFixed];
+    } else if ([model respondsToSelector:@selector(saveOnlyRequiredIconLocationsAsFixed)]) {
+        [model saveOnlyRequiredIconLocationsAsFixed];
+    }
+}
+
 // ===================================================================
 // 视图层
 // ===================================================================
@@ -246,7 +291,30 @@ static void CleanupIconFromPlist(SBIconListModel *model, id icon) {
 %end
 
 // ===================================================================
-// 数据层（完整防御 + 首次快照）
+// Manager 层（强制 Fixed 行为）
+// ===================================================================
+%hook SBHIconManager
+
+- (long long)listsFixedIconLocationBehavior {
+    return 1;
+}
+
+- (long long)listsFixedIconLocationBehaviorForFolderClass:(Class)cls {
+    return 1;
+}
+
+- (long long)iconModel:(id)model listsFixedIconLocationBehaviorForFolderClass:(Class)cls {
+    return 1;
+}
+
+- (void)ensureFixedIconLocationsIfNecessary {
+    // 空实现，防止系统强制重置我们的 Fixed
+}
+
+%end
+
+// ===================================================================
+// 数据层
 // ===================================================================
 %hook SBIconListModel
 
@@ -264,7 +332,7 @@ static void CleanupIconFromPlist(SBIconListModel *model, id icon) {
 
 - (BOOL)isIconFixed:(id)icon {
     if (!icon || IsDockList(self)) return %orig;
-    return YES; // 强制全部视为 Fixed
+    return YES;
 }
 
 - (BOOL)isIconFixed:(id)icon gridCellInfoOptions:(unsigned long long)options {
@@ -283,7 +351,6 @@ static void CleanupIconFromPlist(SBIconListModel *model, id icon) {
     if (cfg && cfg[iconID]) {
         unsigned long long loc = [cfg[iconID] unsignedLongLongValue];
         if (loc < [self maxNumberOfIcons]) {
-            // 确保内部字典也同步
             if ([self respondsToSelector:@selector(setFixedLocation:forIcon:options:)]) {
                 [self setFixedLocation:loc forIcon:icon options:0];
             }
@@ -291,7 +358,7 @@ static void CleanupIconFromPlist(SBIconListModel *model, id icon) {
         }
     }
 
-    // 没有记录 → 获取当前真实位置并立即记录（首次快照的补充）
+    // 没有记录 → 记录当前真实位置（首次快照补充）
     unsigned long long loc = NSNotFound;
     if ([self respondsToSelector:@selector(gridCellIndexForIcon:gridCellInfoOptions:)]) {
         loc = [self gridCellIndexForIcon:icon gridCellInfoOptions:0];
@@ -300,15 +367,7 @@ static void CleanupIconFromPlist(SBIconListModel *model, id icon) {
         loc = [self indexForIcon:icon];
     }
     if (loc != NSNotFound && loc < [self maxNumberOfIcons]) {
-        NSMutableDictionary *listConfig = [gGridConfig[listID] mutableCopy] ?: [NSMutableDictionary new];
-        listConfig[iconID] = @(loc);
-        gGridConfig[listID] = listConfig;
-        SaveGridConfig();
-        if ([self respondsToSelector:@selector(setFixedLocation:forIcon:options:)]) {
-            [self setFixedLocation:loc forIcon:icon options:0];
-        } else {
-            [self setFixedLocation:loc forIcon:icon];
-        }
+        ForceSaveFixedLocation(self, icon, loc);
         return loc;
     }
     return %orig;
@@ -348,82 +407,30 @@ static void CleanupIconFromPlist(SBIconListModel *model, id icon) {
 
 - (id)insertIcon:(id)icon atGridCellIndex:(unsigned long long)index gridCellInfoOptions:(unsigned long long)options mutationOptions:(unsigned long long)mutationOptions {
     id result = %orig;
-    if (!icon || index == NSNotFound || IsDockList(self)) return result;
-    NSString *listID = [self uniqueIdentifier];
-    NSString *iconID = GetIconID(icon);
-    if (listID && iconID && index < [self maxNumberOfIcons]) {
-        if ([self respondsToSelector:@selector(setFixedLocation:forIcon:options:)]) {
-            [self setFixedLocation:index forIcon:icon options:0];
-        } else {
-            [self setFixedLocation:index forIcon:icon];
-        }
-        LoadGridConfig();
-        NSMutableDictionary *listConfig = [gGridConfig[listID] mutableCopy] ?: [NSMutableDictionary new];
-        listConfig[iconID] = @(index);
-        gGridConfig[listID] = listConfig;
-        SaveGridConfig();
-    }
+    ForceSaveFixedLocation(self, icon, index);
     return result;
 }
 
 - (id)insertIcon:(id)icon atIndex:(unsigned long long)index options:(unsigned long long)options {
     id result = %orig;
-    if (!icon || IsDockList(self)) return result;
     unsigned long long gridIdx = [self fixedLocationForIcon:icon];
-    if (gridIdx != NSNotFound && gridIdx < [self maxNumberOfIcons]) {
-        NSString *listID = [self uniqueIdentifier];
-        NSString *iconID = GetIconID(icon);
-        if (listID && iconID) {
-            if ([self respondsToSelector:@selector(setFixedLocation:forIcon:options:)]) {
-                [self setFixedLocation:gridIdx forIcon:icon options:0];
-            }
-            LoadGridConfig();
-            NSMutableDictionary *listConfig = [gGridConfig[listID] mutableCopy] ?: [NSMutableDictionary new];
-            listConfig[iconID] = @(gridIdx);
-            gGridConfig[listID] = listConfig;
-            SaveGridConfig();
-        }
+    if (gridIdx != NSNotFound) {
+        ForceSaveFixedLocation(self, icon, gridIdx);
     }
     return result;
 }
 
 - (id)moveContainedIcon:(id)icon toGridCellIndex:(unsigned long long)index gridCellInfoOptions:(unsigned long long)options mutationOptions:(unsigned long long)mutationOptions {
     id result = %orig;
-    if (!icon || index == NSNotFound || IsDockList(self)) return result;
-    NSString *listID = [self uniqueIdentifier];
-    NSString *iconID = GetIconID(icon);
-    if (listID && iconID && index < [self maxNumberOfIcons]) {
-        if ([self respondsToSelector:@selector(setFixedLocation:forIcon:options:)]) {
-            [self setFixedLocation:index forIcon:icon options:0];
-        } else {
-            [self setFixedLocation:index forIcon:icon];
-        }
-        LoadGridConfig();
-        NSMutableDictionary *listConfig = [gGridConfig[listID] mutableCopy] ?: [NSMutableDictionary new];
-        listConfig[iconID] = @(index);
-        gGridConfig[listID] = listConfig;
-        SaveGridConfig();
-    }
+    ForceSaveFixedLocation(self, icon, index);
     return result;
 }
 
 - (void)moveContainedIcon:(id)icon toIndex:(unsigned long long)index options:(unsigned long long)options {
     %orig;
-    if (!icon || IsDockList(self)) return;
     unsigned long long gridIdx = [self fixedLocationForIcon:icon];
-    if (gridIdx != NSNotFound && gridIdx < [self maxNumberOfIcons]) {
-        NSString *listID = [self uniqueIdentifier];
-        NSString *iconID = GetIconID(icon);
-        if (listID && iconID) {
-            if ([self respondsToSelector:@selector(setFixedLocation:forIcon:options:)]) {
-                [self setFixedLocation:gridIdx forIcon:icon options:0];
-            }
-            LoadGridConfig();
-            NSMutableDictionary *listConfig = [gGridConfig[listID] mutableCopy] ?: [NSMutableDictionary new];
-            listConfig[iconID] = @(gridIdx);
-            gGridConfig[listID] = listConfig;
-            SaveGridConfig();
-        }
+    if (gridIdx != NSNotFound) {
+        ForceSaveFixedLocation(self, icon, gridIdx);
     }
 }
 
