@@ -1,7 +1,7 @@
 Package: com.iosdump.freegrid
 Name: FreeGrid
 Version: 0.0.1
-Description: 仅支持 iOS 17 桌面图标随意摆放
+Description: 桌面图标随意摆放，仅支持 iOS 17 
 Architecture: iphoneos-arm64
 Author: iosdump
 Maintainer: iosdump
