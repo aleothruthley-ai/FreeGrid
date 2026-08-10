@@ -1,6 +1,7 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 
 // ===================================================================
 // 结构体定义
@@ -16,7 +17,7 @@ struct SBHIconGridRange {
 };
 
 // ===================================================================
-// 接口声明
+// 接口声明（完整声明，避免 forward declaration 错误）
 // ===================================================================
 @interface SBIcon : NSObject
 - (NSString *)leafIdentifier;
@@ -92,6 +93,11 @@ struct SBHIconGridRange {
 - (long long)listsFixedIconLocationBehaviorForFolderClass:(Class)cls;
 - (long long)iconModel:(id)model listsFixedIconLocationBehaviorForFolderClass:(Class)cls;
 - (void)ensureFixedIconLocationsIfNecessary;
+@end
+
+// 完整声明 SBIconView，解决 forward declaration + [self icon] 错误
+@interface SBIconView : UIView
+- (id)icon;
 @end
 
 // ===================================================================
@@ -223,8 +229,12 @@ static BOOL IsPlaceholderIcon(id icon) {
     @try {
         Class phClass = NSClassFromString(@"SBPlaceholderIcon");
         if (phClass && [icon isKindOfClass:phClass]) return YES;
-        // 兼容部分版本
-        if ([icon respondsToSelector:@selector(isPlaceholder)] && [icon isPlaceholder]) return YES;
+
+        // 安全调用 isPlaceholder（避免编译器报“no known instance method”）
+        if ([icon respondsToSelector:@selector(isPlaceholder)]) {
+            BOOL (*msgSend)(id, SEL) = (BOOL (*)(id, SEL))objc_msgSend;
+            if (msgSend(icon, @selector(isPlaceholder))) return YES;
+        }
     } @catch (__unused NSException *e) {}
     return NO;
 }
@@ -240,7 +250,7 @@ static void SafeSetFixedLocation(SBIconListModel *model, id icon, unsigned long 
     } @catch (__unused NSException *e) {}
 }
 
-// 只清理配置，绝不在敏感路径主动重新分配位置（防止和 placeholder 打架）
+// 只清理配置，绝不在敏感路径主动重新分配位置
 static void ForceRemoveFixedFromConfig(SBIconListModel *model, id icon) {
     if (!model || !icon || IsPlaceholderIcon(icon)) return;
     @try {
@@ -269,7 +279,7 @@ static void ForceRemoveFixedFromConfig(SBIconListModel *model, id icon) {
     } @catch (__unused NSException *e) {}
 }
 
-// 核心 Apply（拖拽期间完全跳过，避免干扰 placeholder）
+// 核心 Apply（拖拽期间完全跳过）
 static void ApplyUserMovedLocations(SBIconListModel *model) {
     if (!model || IsDockList(model) || gIsDuringMutation) return;
 
@@ -338,7 +348,7 @@ static void ApplyUserMovedLocations(SBIconListModel *model) {
 
         for (id icon in icons) {
             if (!icon || IsPlaceholderIcon(icon)) continue;
-            // 正在被拖的图标暂时不强制 fixed，让 placeholder 能正常工作
+            // 正在被拖的图标暂时不强制 fixed
             if ([gCurrentlyDraggedIcons containsObject:icon]) continue;
 
             NSString *iconID = GetIconID(icon);
@@ -408,7 +418,6 @@ static void RecordUserMovedIcon(SBIconListModel *model, id icon, unsigned long l
         [gConfigLock unlock];
         SaveGridConfig();
 
-        // 记录后再 Apply（此时 mutation 已结束）
         ApplyUserMovedLocations(model);
     } @catch (__unused NSException *e) {}
 }
@@ -488,7 +497,7 @@ static void RecordUserMovedIcon(SBIconListModel *model, id icon, unsigned long l
 %end
 
 // ===================================================================
-// 数据层（崩溃安全重点修改）
+// 数据层
 // ===================================================================
 %hook SBIconListModel
 
@@ -506,7 +515,6 @@ static void RecordUserMovedIcon(SBIconListModel *model, id icon, unsigned long l
 
 - (BOOL)isIconFixed:(id)icon {
     if (!icon || IsDockList(self) || IsPlaceholderIcon(icon)) return %orig;
-    // 正在被拖的图标暂时不视为 fixed，让系统能正常加 placeholder
     if ([gCurrentlyDraggedIcons containsObject:icon]) return NO;
 
     @try {
@@ -651,7 +659,6 @@ static void RecordUserMovedIcon(SBIconListModel *model, id icon, unsigned long l
     return %orig;
 }
 
-// ========== 插入 / 移动（安全版：只在成功后记录，不再主动位移） ==========
 - (id)insertIcon:(id)icon atGridCellIndex:(unsigned long long)index gridCellInfoOptions:(unsigned long long)options mutationOptions:(unsigned long long)mutationOptions {
     gIsDuringMutation = YES;
     id result = %orig;
@@ -749,7 +756,7 @@ static void RecordUserMovedIcon(SBIconListModel *model, id icon, unsigned long l
 %end
 
 // ===================================================================
-// 额外：跟踪当前正在拖拽的图标（关键！防止 lift 阶段崩溃）
+// 跟踪当前正在拖拽的图标（关键！防止 lift 阶段崩溃）
 // ===================================================================
 %hook SBIconView
 
