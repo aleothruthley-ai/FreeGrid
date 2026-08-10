@@ -1,3 +1,7 @@
+DEBUG = 0
+FINALPACKAGE = 1
+PACKAGE_VERSION = 0.1
+
 TARGET := iphone:clang:latest:15.0
 ARCHS = arm64 arm64e
 INSTALL_TARGET_PROCESSES = SpringBoard
